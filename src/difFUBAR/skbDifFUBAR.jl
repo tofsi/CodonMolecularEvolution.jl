@@ -171,11 +171,14 @@ function log_likelihood(model::SKBDIModel, ambient_sample::Vector{Float64})
 
 end
 
-function hedwigs_ambient_to_parameter_transform(model::SKBDIModel, ambient_sample::Vector{Float64}, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, kernel_function::Function, epsilon::Float64=1e-6)
+function hedwigs_ambient_to_parameter_transform(ambient_sample::Vector{Float64}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, kernel_function::Function, epsilon::Float64=1e-6)
     """
     Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
     """
-    kernel_parameters, suppression_parameters, unsuppressed_parameters = split_parameters(model, ambient_sample)
+
+    kernel_parameters = ambient_sample[1:kernel_dim]
+    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
+    unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
     kernel_parameters = kernel_stddev * kernel_parameters
     suppression_parameters = suppression_stddev * suppression_parameters
     covariance_matrix = kernel_function(kernel_parameters, square_distance_matrix) + epsilon * I # Tykhonoff regularization
@@ -209,7 +212,7 @@ end
 
 function calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,
     ambient_samples::Vector{Vector{Float64}},
-    burnin::Int, progress=false)
+    burnin::Int; progress=false)
     """
     Samples the allocation grid from the ambient samples
     TODO: WHY DOES THIS TAKE SO MUCH TIME x_x
@@ -239,7 +242,7 @@ end
 
 
 function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
-    tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=5000,
+    tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=100,
     burnin::Int=0, concentration=0.1, binarize=false, verbosity=1,
     exports=true, exports2json=false, code=MolecularEvolution.universal_code,
     optimize_branch_lengths=false, version=nothing, t=0)
@@ -259,7 +262,7 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
                 param_kinds, shallow_tree, background_omega_grid, codon_param_index_vec), grid_time) =
             @timed CodonMolecularEvolution.difFUBAR_grid(
                 tree, tags, GTRmat, F3x4_freqs, code, verbosity=verbosity,
-                foreground_grid=4, background_grid=2, version=version, t=t)
+                foreground_grid=2, background_grid=2, version=version, t=t)
         # We should figure out a good prior dist for F(s)
         transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -1, 1)
         # Define the masks for the suppression parameters
@@ -282,8 +285,10 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
             con_lik_matrix,
             codon_param_vec,
             codon_param_index_vec,
-            ambient_sample -> hedwigs_ambient_to_parameter_transform(model,
+            ambient_sample -> hedwigs_ambient_to_parameter_transform(
                 ambient_sample,
+                1,
+                size(hypothesis_masks, 1),
                 kernel_stddev,
                 suppression_stddev,
                 square_distance_matrix,
@@ -316,16 +321,32 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
     return df, (alloc_grid, ambient_samples, model, tag_colors), merge(plot_collection...)
 end
 
-analysis_name = "output/Ace2"
-seqnames, seqs = read_fasta("test/data/Ace2_tiny/Ace2_tiny_tagged.fasta");
-treestring, tags, tag_colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged.nex")
-df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name)
-alloc_grid, ambient_samples, model, _ = results
-model.transition_function = nothing # Problems loading and saving anonymous functions
+function main()
+    analysis_name = "output/Ace2"
+    seqnames, seqs = read_fasta("test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
+    treestring, tags, tag_colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged.nex")
+    df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name)
+    alloc_grid, ambient_samples, model, _ = results
 
-@save "output/alloc_grid.jld2" alloc_grid
-@save "output/ambient_samples.jld2" ambient_samples
-@save "output/grid.jld2" model
+    @save "output/alloc_grid.jld2" alloc_grid
+    @save "output/ambient_samples.jld2" ambient_samples
+    model_dict = Dict( # We don't save the functions, so we can load this later
+        :parameter_grids => model.parameter_grids,
+        :parameter_names => model.parameter_names,
+        :hypothesis_masks => model.hypothesis_masks,
+        :log_con_lik_matrix => model.log_con_lik_matrix,
+        :con_lik_matrix => model.con_lik_matrix,
+        :codon_param_vec => model.codon_param_vec,
+        :codon_param_index_vec => model.codon_param_index_vec,
+        :kernel_dim => model.kernel_dim,
+        :masks => model.masks,
+        :mask_subset_indicators => model.mask_subset_indicators,
+        :suppression_dim => model.suppression_dim,
+        :unsuppressed_dim => model.unsuppressed_dim,
+        :total_dim => model.total_dim
+    )
 
+    @save "output/model.jld2" model_dict
+end
 
-
+main()
