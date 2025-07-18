@@ -242,8 +242,8 @@ end
 
 
 function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
-    tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=100,
-    burnin::Int=0, concentration=0.1, binarize=false, verbosity=1,
+    tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=5000,
+    burnin::Int=div(iters, 4), concentration=0.1, binarize=false, verbosity=1,
     exports=true, exports2json=false, code=MolecularEvolution.universal_code,
     optimize_branch_lengths=false, version=nothing, t=0)
     # TODO: Split this up into multiple fcts because the setup is mostly shared with difFUBAR
@@ -262,12 +262,15 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
                 param_kinds, shallow_tree, background_omega_grid, codon_param_index_vec), grid_time) =
             @timed CodonMolecularEvolution.difFUBAR_grid(
                 tree, tags, GTRmat, F3x4_freqs, code, verbosity=verbosity,
-                foreground_grid=2, background_grid=2, version=version, t=t)
+                foreground_grid=6, background_grid=4, version=version, t=t)
+        println(codon_param_vec[1])
+        println(param_kinds)
         # We should figure out a good prior dist for F(s)
         transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -1, 1)
         # Define the masks for the suppression parameters
         # TODO: Make this an argument to this function
         hypothesis_masks = ones(Bool, (4, size(con_lik_matrix)[1]))
+
         hypothesis_masks[1, :] = [c[2] > 1 for c in codon_param_vec] # omega_1 > 1
         hypothesis_masks[2, :] = [c[3] > 1 for c in codon_param_vec] # omega_2 > 1
         hypothesis_masks[3, :] = [c[2] > c[3] for c in codon_param_vec] # omega_1 > omega_2
@@ -324,7 +327,7 @@ end
 function main()
     analysis_name = "output/Ace2"
     seqnames, seqs = read_fasta("test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
-    treestring, tags, tag_colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged.nex")
+    treestring, tags, tag_colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged_no_bg_tags_flipped.nex")
     df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name)
     alloc_grid, ambient_samples, model, _ = results
 
@@ -350,3 +353,20 @@ function main()
 end
 
 main()
+function hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_param_vec::Vector{Vector{Float64}})
+    ω1 = [c[2] for c in codon_param_vec]
+    ω2 = [c[3] for c in codon_param_vec]
+    alphas = [c[1] for c in codon_param_vec]
+    ω1_greater_filt = ω1 .> ω2
+    ω2_greater_filt = ω2 .> ω1
+    ω1_pos_filt = ω1 .> 1.0
+    ω2_pos_filt = ω2 .> 1.0
+    posterior_probabilities = zeros(size(alloc_grid, 2), 4)
+    for site in 1:size(alloc_grid, 2)
+        posterior_probabilities[site, 1] = sum(alloc_grid[ω1_greater_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 2] = sum(alloc_grid[ω2_greater_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 3] = sum(alloc_grid[ω1_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 4] = sum(alloc_grid[ω2_pos_filt, site]) / sum(alloc_grid[:, site])
+    end
+    return posterior_probabilities
+end
