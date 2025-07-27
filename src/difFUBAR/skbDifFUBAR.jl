@@ -1,4 +1,5 @@
-using Statistics, Combinatorics, Distributions, MCMCChains, LinearAlgebra, Phylo, FASTX, MolecularEvolution, CodonMolecularEvolution, Plots, EllipticalSliceSampling, AbstractMCMC, NNlib, StatsBase, ProgressMeter, JLD2
+using Statistics, Combinatorics, Distributions, MCMCChains, LinearAlgebra, Phylo, FASTX, MolecularEvolution, CodonMolecularEvolution, Plots, EllipticalSliceSampling, AbstractMCMC, NNlib, StatsBase, ProgressMeter, JLD2, AdvancedHMC, LogDensityProblems, ForwardDiff, LogDensityProblemsAD, Zygote
+
 
 """
 # GeneralizedFUBARModel
@@ -20,8 +21,59 @@ struct GeneralizedFUBARModel
     con_lik_matrix::Matrix{Float64}
 end
 
-function log_posterior(model::GeneralizedFUBARModel, parameters::Vector{Float64})
-    return model.log_likelihood(model.parameters_to_probability_vector(parameters)) + model.prior.log_pdf(parameters)
+
+function log_posterior(model::GeneralizedFUBARModel, parameters::AbstractVector{<:Real})
+    return model.log_likelihood(parameters) + logpdf(model.prior, parameters)
+end
+
+
+
+struct FUBARLogDensity
+    model::GeneralizedFUBARModel
+end
+
+#import LogDensityProblems: logdensity, dimension
+
+function LogDensityProblems.logdensity(p::FUBARLogDensity, parameters::AbstractVector{<:Real})
+    return log_posterior(p.model, parameters)
+end
+
+function LogDensityProblems.dimension(p::FUBARLogDensity)
+    return p.model.n_parameters
+end
+
+function LogDensityProblems.capabilities(::Type{FUBARLogDensity})
+    return LogDensityProblems.LogDensityOrder{0}()
+end
+
+function logp_and_grad(θ)
+    logp, back = Zygote.pullback(θ -> FUBARLogDensity(model)(θ), θ)
+    grad = back(1.0)[1]
+    return logp, grad
+end
+
+function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64; progress=false)
+    """
+    Samples from the model using NUTS.
+    """
+
+    initial_parameters = rand(model.prior)
+    target = FUBARLogDensity(model)
+
+    #ad_target = ADgradient(:Zygote, target)
+    metric = DiagEuclideanMetric(target.model.n_parameters)
+
+    hamiltonian = Hamiltonian(metric, target, Zygote)
+    n_adapts = div(iters, 10) # Number of adaptation steps
+    print("finding good epsilon...\n")
+    epsilon = find_good_stepsize(hamiltonian, initial_parameters)
+    integrator = Leapfrog(epsilon)
+    print("Epsilon used: ", epsilon, "\n")
+
+    kernel = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
+    adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
+    samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; progress=progress)
+    return samples, stats
 end
 
 """
@@ -132,17 +184,20 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
         total_dim)
 end
 
-function split_parameters(model::SKBDIModel, parameters::Vector{Float64})
+function split_parameters(model::SKBDIModel, parameters::AbstractVector{<:Real})
     """
     Splits the parameters into kernel, suppression, and unsuppressed parameters.
     """
-    kernel_parameters = parameters[1:model.kernel_dim]
-    suppression_parameters = parameters[model.kernel_dim+1:model.kernel_dim+model.suppression_dim]
-    unsuppressed_parameters = parameters[model.kernel_dim+model.suppression_dim+1:end]
+
+    begin
+        kernel_parameters = parameters[1:model.kernel_dim]
+        suppression_parameters = parameters[model.kernel_dim+1:model.kernel_dim+model.suppression_dim]
+        unsuppressed_parameters = parameters[model.kernel_dim+model.suppression_dim+1:end]
+    end
     return kernel_parameters, suppression_parameters, unsuppressed_parameters
 end
 
-function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64})
+function to_probability_vector(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
     """
     Computes the probability vector for the model given the parameters.
     parameters start with kernel parameters, followed by suppression parameters, 
@@ -162,20 +217,18 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
     return any(probability_vector .> 0.0) ? probability_vector ./ sum(probability_vector) : probability_vector
 end
 
-function log_likelihood(model::SKBDIModel, ambient_sample::Vector{Float64})
+function log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
     """
     Computes the log-likelihood of the model given the parameters.
     """
     probability_vector = to_probability_vector(model, ambient_sample)
     return sum(log.(model.con_lik_matrix' * probability_vector))
-
 end
 
-function hedwigs_ambient_to_parameter_transform(ambient_sample::Vector{Float64}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, kernel_function::Function, epsilon::Float64=1e-6)
+function hedwigs_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, kernel_function::Function, epsilon::Float64=1e-6)
     """
     Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
     """
-
     kernel_parameters = ambient_sample[1:kernel_dim]
     suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
     unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
@@ -184,10 +237,36 @@ function hedwigs_ambient_to_parameter_transform(ambient_sample::Vector{Float64},
     covariance_matrix = kernel_function(kernel_parameters, square_distance_matrix) + epsilon * I # Tykhonoff regularization
     unsuppressed_parameters = CodonMolecularEvolution.krylov_sqrt_times_vector(covariance_matrix,
         unsuppressed_parameters)
-    return vcat(kernel_parameters, suppression_parameters, unsuppressed_parameters)
+
+    #unsuppressed_parameters = cholesky(covariance_matrix).L * unsuppressed_parameters
+    res = vcat(kernel_parameters, suppression_parameters, unsuppressed_parameters)
+    return res
 end
 
-function fast_cov_mat_hedwigs_kernel(c::Vector{Float64}, square_distance_matrix::Matrix{Int64})
+function toves_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, weight_function::Function)
+    """
+    Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
+    """
+
+    kernel_parameters = ambient_sample[1:kernel_dim]
+    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
+    ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
+    kernel_parameters = kernel_stddev * kernel_parameters
+    suppression_parameters = suppression_stddev * suppression_parameters
+    weight_matrix = weight_function(kernel_parameters, square_distance_matrix)
+    return vcat(kernel_parameters, suppression_parameters, vec((weight_matrix * ambient_unsuppressed_parameters)))
+end
+
+
+function toves_weight_function(c::AbstractVector{<:Real}, square_distance_matrix::Matrix{Int64})
+    """
+    A fast implementation of Tove's weight function.
+    """
+    res = exp(-1 / c[1]^2) .^ (square_distance_matrix)
+    return res ./ sqrt.(sum(res .^ 2, dims=2))
+end
+
+function fast_cov_mat_hedwigs_kernel(c::AbstractVector{<:Real}, square_distance_matrix::Matrix{Int64})
     """
     A fast implementation of Hedwig's kernel for the covariance matrix.
     """
@@ -221,7 +300,6 @@ function calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,
     n_sites = size(model.con_lik_matrix, 2)
     alloc_grid = zeros(Int64, size(model.con_lik_matrix))
     theta = zeros(Float64, model.n_categories)
-    println()
     p = progress ? Progress(n_samples - burnin; desc="Sampling allocations") : nothing
     for i = burnin+1:n_samples
         probability_vector = model.to_probability_vector(ambient_samples[i])
@@ -241,7 +319,7 @@ end
 
 
 
-function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
+function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
     tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=5000,
     burnin::Int=div(iters, 4), concentration=0.1, binarize=false, verbosity=1,
     exports=true, exports2json=false, code=MolecularEvolution.universal_code,
@@ -266,19 +344,22 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
         println(codon_param_vec[1])
         println(param_kinds)
         # We should figure out a good prior dist for F(s)
-        transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -1, 1)
+        transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -2, -1)
         # Define the masks for the suppression parameters
         # TODO: Make this an argument to this function
         hypothesis_masks = ones(Bool, (4, size(con_lik_matrix)[1]))
 
         hypothesis_masks[1, :] = [c[2] > 1 for c in codon_param_vec] # omega_1 > 1
-        hypothesis_masks[2, :] = [c[3] > 1 for c in codon_param_vec] # omega_2 > 1
+        hypothesis_masks[2, :] = [c[3] > 1 for c in codon_param_vec] # omega_2 > 1s
         hypothesis_masks[3, :] = [c[2] > c[3] for c in codon_param_vec] # omega_1 > omega_2
         hypothesis_masks[4, :] = [c[3] > c[2] for c in codon_param_vec] # omega_2 > omega_1
 
         square_distance_matrix = generate_square_l2_distance_matrix(codon_param_index_vec)
-        kernel_stddev = 1.0 # example values idk what these should be xD
-        suppression_stddev = 1.0
+        #kernel_stddev = 1.0 # example values idk what these should be xD
+        suppression_stddev = 0.1
+        #kernel_stddev = [2.0 0.0; 0.0 1.0]
+        kernel_stddev = 0.5
+
         model = SKBDIModel(
             [alphagrid, omegagrid, background_omega_grid],
             ["alpha", "omega_1", "omega_2", "background_omega"],
@@ -288,24 +369,34 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
             con_lik_matrix,
             codon_param_vec,
             codon_param_index_vec,
-            ambient_sample -> hedwigs_ambient_to_parameter_transform(
+            ambient_sample -> toves_ambient_to_parameter_transform(
                 ambient_sample,
                 1,
                 size(hypothesis_masks, 1),
                 kernel_stddev,
                 suppression_stddev,
                 square_distance_matrix,
-                fast_cov_mat_hedwigs_kernel),
+                toves_weight_function),
             1
         )
+
         # One further step of abstraction skbdi -> generalized fubar
         fubar_model = GeneralizedFUBARModel(model)
-        ess_model = ESSModel(fubar_model.prior, fubar_model.log_likelihood)
+
         if verbosity > 0
             println("Step 4: Sampling from the model.")
         end
+        ambient_samples = nothing
+
         sample_time = @elapsed begin
-            ambient_samples = AbstractMCMC.sample(ess_model, ESS(), iters, progress=true)
+            if sampler == "ess"
+                ess_model = ESSModel(fubar_model.prior, fubar_model.log_likelihood)
+                ambient_samples = AbstractMCMC.sample(ess_model, ESS(), iters, progress=true)
+            elseif sampler == "nuts"
+                ambient_samples = sample_NUTS(fubar_model, iters; progress=verbosity > 0)
+            else
+                error("Unknown sampler: $sampler. Use 'ess' or 'nuts'.")
+            end
             alloc_grid, theta = calculate_alloc_grid_and_theta(fubar_model, ambient_samples, burnin, progress=verbosity > 0)
         end
     end
@@ -319,7 +410,7 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath;
             treestring=treestring, seqnames=seqnames, seqs=seqs,
             leaf_name_transform=leaf_name_transform, pos_thresh=pos_thresh,
             iters=iters, burnin=burnin, concentration=concentration, binarize=binarize, exports=exports2json))
-    #Return df, (tuple of partial calculations needed to re-run tablulate), plots
+    # Return df, (tuple of partial calculations needed to re-run tablulate), plots 
     push!(plot_collection, plots_named_tuple)
     return df, (alloc_grid, ambient_samples, model, tag_colors), merge(plot_collection...)
 end
@@ -327,8 +418,10 @@ end
 function main()
     analysis_name = "output/Ace2"
     seqnames, seqs = read_fasta("test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
-    treestring, tags, tag_colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged_no_bg_tags_flipped.nex")
-    df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name)
+    treestring = readlines(open("test/data/Ace2_tiny/tiny_tagged_no_bg.tre"))[1]
+    #treestring, tags, colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged_no_bg_tags_flipped.nex")
+    tags = ["{G1}", "{G2}"]
+    df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name, "nuts"; iters=1)
     alloc_grid, ambient_samples, model, _ = results
 
     @save "output/alloc_grid.jld2" alloc_grid
@@ -363,10 +456,12 @@ function hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_par
     ω2_pos_filt = ω2 .> 1.0
     posterior_probabilities = zeros(size(alloc_grid, 2), 4)
     for site in 1:size(alloc_grid, 2)
-        posterior_probabilities[site, 1] = sum(alloc_grid[ω1_greater_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 2] = sum(alloc_grid[ω2_greater_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 3] = sum(alloc_grid[ω1_pos_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 4] = sum(alloc_grid[ω2_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 1] = sum(alloc_grid[ω1_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 2] = sum(alloc_grid[ω2_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 3] = sum(alloc_grid[ω1_greater_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 4] = sum(alloc_grid[ω2_greater_filt, site]) / sum(alloc_grid[:, site])
     end
     return posterior_probabilities
 end
+
+
