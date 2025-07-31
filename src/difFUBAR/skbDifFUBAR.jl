@@ -46,13 +46,7 @@ function LogDensityProblems.capabilities(::Type{FUBARLogDensity})
     return LogDensityProblems.LogDensityOrder{0}()
 end
 
-function logp_and_grad(θ)
-    logp, back = Zygote.pullback(θ -> FUBARLogDensity(model)(θ), θ)
-    grad = back(1.0)[1]
-    return logp, grad
-end
-
-function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64; progress=false)
+function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64; progress=false)
     """
     Samples from the model using NUTS.
     """
@@ -62,18 +56,36 @@ function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64; progress=false)
 
     #ad_target = ADgradient(:Zygote, target)
     metric = DiagEuclideanMetric(target.model.n_parameters)
-
-    hamiltonian = Hamiltonian(metric, target, Zygote)
-    n_adapts = div(iters, 10) # Number of adaptation steps
+    hamiltonian = Hamiltonian(metric, target, Zygote) # We use zygote because it is good for the case R^n → R 
+    n_adapts = div(iters, 10) # Number of adaptation steps, Default is min(1000, div(iters, 10))
     print("finding good epsilon...\n")
     epsilon = find_good_stepsize(hamiltonian, initial_parameters)
     integrator = Leapfrog(epsilon)
     print("Epsilon used: ", epsilon, "\n")
 
+    ambient_samples = Vector{Any}(undef, n_chains)
     kernel = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
     adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
-    samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; progress=progress)
-    return samples, stats
+    stats = nothing
+    if n_chains > 1
+        #= Threads.@threads for i in 1:n_chains
+            initial_parameters = rand(model.prior)
+            samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false)
+            ambient_samples[i] = samples
+        end =#
+        Threads.@sync for i in 1:n_chains
+            Threads.@spawn begin
+                local_initial = rand(model.prior)
+                local_samples, _ = sample(hamiltonian, kernel, local_initial, iters, adaptor, n_adapts; verbose=false)
+                ambient_samples[i] = local_samples
+            end
+        end
+    else
+        samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false, progress=false)
+        ambient_samples[1] = samples
+    end
+
+    return ambient_samples, stats
 end
 
 """
@@ -197,24 +209,71 @@ function split_parameters(model::SKBDIModel, parameters::AbstractVector{<:Real})
     return kernel_parameters, suppression_parameters, unsuppressed_parameters
 end
 
+function softmin(x::AbstractVector{<:Real})
+    """
+    Computes the softmin of a vector.
+    """
+    return exp.(-x) ./ sum(exp.(-x))
+end
+
 function to_probability_vector(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
     """
     Computes the probability vector for the model given the parameters.
     parameters start with kernel parameters, followed by suppression parameters, 
     and then unsuppressed parameters.
-    TODO: we wanna return the minimum of suppression params in case of overlap probably, not multiplying them
     """
     parameters = model.ambient_to_parameter_transform(ambient_sample)
     _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
     probability_vector = softmax(unsuppressed_parameters)
     # Apply the transition functions for each suppression parameter
     transition_function_values = model.transition_function.(suppression_parameters)
+    suppression_weights = ones(length(probability_vector))
     for i in 1:size(model.masks, 1)
+        mask = model.masks[i, :]
+        subset_mask = model.mask_subset_indicators[i, :]
+        #suppression_factor = minimum(transition_function_values[subset_mask])
+        suppression_factor = 1.0
+        suppression_factor = mean(transition_function_values[subset_mask])
+
+        # TODO: find out the best way to combine the transition function values
         # In the case of hypothesis overlap, we take the minimum of the transition functions
-        probability_vector[model.masks[i, :]] .*= minimum(
-            transition_function_values[model.mask_subset_indicators[i, :]])
+        suppression_weights = suppression_weights .* ifelse.(mask, suppression_factor, 1.0)
     end
-    return any(probability_vector .> 0.0) ? probability_vector ./ sum(probability_vector) : probability_vector
+    suppressed_probabilities = probability_vector .* suppression_weights
+    if all(suppressed_probabilities .== 0.0)
+        error("all suppressed probabilities are zero")
+    end
+    return suppressed_probabilities ./ sum(suppressed_probabilities)
+end
+
+function to_probability_vector(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
+    """
+    Computes the probability vector for the model given the parameters.
+    parameters start with kernel parameters, followed by suppression parameters, 
+    and then unsuppressed parameters.
+    """
+    parameters = model.ambient_to_parameter_transform(ambient_sample)
+    _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
+    probability_vector = softmax(unsuppressed_parameters)
+    # Apply the transition functions for each suppression parameter
+    transition_function_values = model.transition_function.(suppression_parameters)
+    suppression_weights = ones(length(probability_vector))
+    for i in 1:size(model.masks, 1)
+        #= mask = model.masks[i, :]
+        subset_mask = model.mask_subset_indicators[i, :]
+        suppression_factor = mean(transition_function_values[subset_mask]) =#
+
+        # TODO: find out the best way to combine the transition function values
+        # In the case of hypothesis overlap, we take the minimum of the transition functions
+        # suppression_weights = suppression_weights .* ifelse.(mask, suppression_factor, 1.0)
+        suppression_factor = mean(transition_function_values[model.mask_subset_indicators[i, :]])
+        suppression_weights = suppression_weights .* ifelse.(model.masks[i], suppression_factor, 1.0)
+    end
+    suppressed_probabilities = probability_vector .* suppression_weights
+    if all(suppressed_probabilities .== 0.0)
+        error("all suppressed probabilities are zero")
+    end
+    return suppressed_probabilities ./ sum(suppressed_probabilities)
 end
 
 function log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
@@ -318,13 +377,52 @@ function calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,
 end
 
 
+"""
+    skbdifFUBAR(seqnames, seqs, treestring, tags, outpath; <keyword arguments>)
 
-function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
+Takes a tagged phylogeny and an alignment as input and performs SKBDI + difFUBAR analysis.
+Returns `df, results_tuple, plots_named_tuple` where `df` is a DataFrame of the detected sites, `results_tuple` is a tuple of the partial calculations needed to re-run `difFUBAR_tabulate_and_plot`, and `plots_named_tuple` is a named tuple of plots.
+Consistent with the docs of [`difFUBAR_tabulate_and_plot`](@ref), `results_tuple` stores `(alloc_grid, codon_param_vec, alphagrid, omegagrid, tag_colors)`.
+
+# Arguments
+- `seqnames`: vector of untagged sequence names.
+- `seqs`: vector of aligned sequences, corresponding to `seqnames`.
+- `treestring`: a tagged newick tree string.
+- `tags`: vector of tag signatures.
+- `outpath`: export directory.
+- `sampler::String`: the sampler to use, either "ess" or "nuts". "ess" uses the ESS sampler, while "nuts" uses the NUTS sampler.
+- `chains=1`: number of chains to use. Only "nuts" supports multiple chains
+- `tag_colors=DIFFUBAR_TAG_COLORS[sortperm(tags)]`: vector of tag colors (hex format). The default option is consistent with the difFUBAR paper (Foreground 1: red, Foreground 2: blue).
+- `pos_thresh=0.95`: threshold of significance for the posteriors.
+- `iters=2500`: iterations used in the Gibbs sampler.
+- `burnin=div(iters, 5)`: burnin used in the Gibbs sampler.
+- `concentration=0.1`: concentration parameter used for the Dirichlet prior.
+- `binarize=false`: if true, the tree is binarized before the analysis.
+- `verbosity=1`: as verbosity increases, prints are added accumulatively. 
+    - 0 - no prints
+    - 1 - show current step and where output files are exported
+    - 2 - show the chosen `difFUBAR_grid` version and amount of parallel threads. Show sampler progress bar.
+- `exports=true`: if true, output files are exported.
+- `exports2json=false`: if true, the results are exported to a JSON file (HyPhy format).
+- `code=MolecularEvolution.universal_code`: genetic code used for the analysis.
+- `optimize_branch_lengths=false`: if true, the branch lengths of the phylogenetic tree are optimized.
+- `version::Union{difFUBARGrid, Nothing}=nothing`: explicitly choose the version of `difFUBAR_grid` to use. If `nothing`, the version is heuristically chosen based on the available RAM and Julia threads.
+- `t=0`: explicitly choose the amount of Julia threads to use. If `0`, the degree of parallelization is heuristically chosen based on the available RAM and Julia threads.
+
+!!! note
+    Julia starts up with a single thread of execution, by default. See [Starting Julia with multiple threads](https://docs.julialang.org/en/v1/manual/multi-threading/#Starting-Julia-with-multiple-threads).
+"""
+function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String; n_chains=1,
     tag_colors=CodonMolecularEvolution.DIFFUBAR_TAG_COLORS[sortperm(tags)], pos_thresh=0.95, iters=5000,
     burnin::Int=div(iters, 4), concentration=0.1, binarize=false, verbosity=1,
     exports=true, exports2json=false, code=MolecularEvolution.universal_code,
     optimize_branch_lengths=false, version=nothing, t=0)
     # TODO: Split this up into multiple fcts because the setup is mostly shared with difFUBAR
+
+    if n_chains > 1 && sampler != "nuts"
+        error("Only NUTS supports multiple chains at the moment. Use sampler='nuts' to use multiple chains.")
+    end
+
     total_time = @elapsed begin
         analysis_name = outpath
         leaf_name_transform = CodonMolecularEvolution.generate_tag_stripper(tags)
@@ -341,10 +439,8 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
             @timed CodonMolecularEvolution.difFUBAR_grid(
                 tree, tags, GTRmat, F3x4_freqs, code, verbosity=verbosity,
                 foreground_grid=6, background_grid=4, version=version, t=t)
-        println(codon_param_vec[1])
-        println(param_kinds)
         # We should figure out a good prior dist for F(s)
-        transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -2, -1)
+        transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, -1, 1)
         # Define the masks for the suppression parameters
         # TODO: Make this an argument to this function
         hypothesis_masks = ones(Bool, (4, size(con_lik_matrix)[1]))
@@ -355,10 +451,8 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
         hypothesis_masks[4, :] = [c[3] > c[2] for c in codon_param_vec] # omega_2 > omega_1
 
         square_distance_matrix = generate_square_l2_distance_matrix(codon_param_index_vec)
-        #kernel_stddev = 1.0 # example values idk what these should be xD
-        suppression_stddev = 0.1
-        #kernel_stddev = [2.0 0.0; 0.0 1.0]
-        kernel_stddev = 0.5
+        suppression_stddev = 1.0
+        kernel_stddev = 2.0
 
         model = SKBDIModel(
             [alphagrid, omegagrid, background_omega_grid],
@@ -386,18 +480,30 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
         if verbosity > 0
             println("Step 4: Sampling from the model.")
         end
-        ambient_samples = nothing
+        ambient_samples = Vector{Any}(undef, n_chains)
+
 
         sample_time = @elapsed begin
             if sampler == "ess"
                 ess_model = ESSModel(fubar_model.prior, fubar_model.log_likelihood)
-                ambient_samples = AbstractMCMC.sample(ess_model, ESS(), iters, progress=true)
+                ambient_samples[1] = AbstractMCMC.sample(ess_model, ESS(), iters, progress=true)
+                print(size(ambient_samples), " samples drawn from the target distribution.\n")
             elseif sampler == "nuts"
-                ambient_samples = sample_NUTS(fubar_model, iters; progress=verbosity > 0)
+                ambient_samples, _ = sample_NUTS(fubar_model, iters, n_chains; progress=verbosity > 0)
+                #println(stats)
+                #ambient_samples = [ambient_samples[i] for i in 1:size(ambient_samples, 1)]
             else
                 error("Unknown sampler: $sampler. Use 'ess' or 'nuts'.")
             end
-            alloc_grid, theta = calculate_alloc_grid_and_theta(fubar_model, ambient_samples, burnin, progress=verbosity > 0)
+            alloc_grid = zeros(Int64, size(fubar_model.con_lik_matrix))
+            theta = zeros(Float64, fubar_model.n_categories)
+
+            for i in 1:n_chains
+                alloc_grid_i, theta_i = calculate_alloc_grid_and_theta(fubar_model, ambient_samples[i], burnin, progress=verbosity > 0)
+                alloc_grid .+= alloc_grid_i
+                theta .+= theta_i
+            end
+            theta ./= n_chains # Average the theta values across chains
         end
     end
     # Now we should have the same stuff that diffubar generates.
@@ -417,11 +523,11 @@ end
 
 function main()
     analysis_name = "output/Ace2"
-    seqnames, seqs = read_fasta("test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
-    treestring = readlines(open("test/data/Ace2_tiny/tiny_tagged_no_bg.tre"))[1]
+    seqnames, seqs = read_fasta("../../test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
+    treestring = readlines(open("../../test/data/Ace2_tiny/tiny_tagged_no_bg.tre"))[1]
     #treestring, tags, colors = import_colored_figtree_nexus_as_tagged_tree("test/data/Ace2_tiny/Ace2_tiny_tagged_no_bg_tags_flipped.nex")
     tags = ["{G1}", "{G2}"]
-    df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name, "nuts"; iters=1)
+    df, results = skbdifFUBAR(seqnames, seqs, treestring, tags, analysis_name, "nuts"; iters=400, n_chains=8)
     alloc_grid, ambient_samples, model, _ = results
 
     @save "output/alloc_grid.jld2" alloc_grid
@@ -445,7 +551,7 @@ function main()
     @save "output/model.jld2" model_dict
 end
 
-main()
+#main()
 function hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_param_vec::Vector{Vector{Float64}})
     ω1 = [c[2] for c in codon_param_vec]
     ω2 = [c[3] for c in codon_param_vec]
