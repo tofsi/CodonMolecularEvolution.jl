@@ -1,3 +1,6 @@
+
+include("../difFUBAR/convolution.jl")
+
 struct AmbientESSProblem
     loglikelihood::Function
     distance_function::Function
@@ -32,16 +35,16 @@ function transform_sample(problem::AmbientESSProblem, θ::AbstractVector;
 end
 # Epsilon is Tykhonoff regularisation
 
-function krylov_sqrt_times_vector(A,v; m = 15)
-    lanczos_iterator = LanczosIterator(A,v)
+function krylov_sqrt_times_vector(A, v; m=15)
+    lanczos_iterator = LanczosIterator(A, v)
     factorization = initialize(lanczos_iterator)
     while length(factorization) < m
         expand!(lanczos_iterator, factorization)
     end
-    Qm = basis(factorization) 
+    Qm = basis(factorization)
     Qm_matrix = hcat([Qm[i] for i in 1:length(Qm)]...)
-    Tm = rayleighquotient(factorization)  
-    Tm_sqrt_firstcol = sqrt(Tm)[:,1]
+    Tm = rayleighquotient(factorization)
+    Tm_sqrt_firstcol = sqrt(Tm)[:, 1]
     return norm(v) * (Qm_matrix * Tm_sqrt_firstcol)
 end
 
@@ -58,6 +61,36 @@ function transform_sample(problem::AmbientESSProblem, θ::AbstractVector,
     return transformed_θ
 end
 
+function reshape_probability_vector(alpha_ind_vec::Vector{Int64}, beta_ind_vec::Vector{Int64}, probability_vector::AbstractVector)
+    probability_array = zeros(length(alpha_ind_vec), length(beta_ind_vec))
+    for i = 1:length(θ)
+        probability_array[alpha_ind_vec[i], beta_ind_vec[i]] = probability_vector[i]
+    end
+    return probability_array
+end
+
+function unreshape_param_vec(alpha_ind_vec::Vector{Int64}, beta_ind_vec::Vector{Int64}, n_categories::Int64, probability_array::AbstractArray)
+    probability_vector = zeros(n_categories)
+    for i = 1:n_categories
+        probability_vector[i] = probability_array[alpha_ind_vec[i], beta_ind_vec[i]]
+    end
+    return probability_vector
+end
+
+function smooth_probability_vector(alpha_ind_vec::Vector{Int64}, beta_ind_vec::Vector{Int64}, probability_vector::AbstractVector, kernel_parameters::AbstractVector)
+    kernel = gaussian_kernel(5, kernel_parameters[1])
+    probability_array = reshape_probability_vector(alpha_ind_vec, beta_ind_vec, probability_vector)
+    transformed_array = apply_separable_convolution(probability_array, kernel)
+    return unreshape_param_vec(alpha_ind_vec, beta_ind_vec, length(probability_vector), transformed_array)
+end
+
+function transform_sample(problem::AmbientESSProblem, alpha_ind_vec::Vector{Int64}, beta_ind_vec::Vector{Int64}, θ::AbstractVector)
+    # All kernel parameters are at the end
+    kernel_parameters = θ[(problem.gaussian_dimension+1):end]
+    ambient_gaussian_parameters = θ[1:problem.gaussian_dimension]
+    transformed_θ = smooth_probability_vector(alpha_ind_vec, beta_ind_vec, ambient_gaussian_parameters)
+    return transformed_θ
+end
 # This function takes in a kernel function and a likelihood function
 # Samples in ambient/uncorrelated space, transforms the sample using the resulting
 # kernel matrix and performs Elliptical Slice sampling
@@ -77,7 +110,7 @@ function kernel_sampling_ess(problem::AmbientESSProblem; m=10,
     # We have to have μ0=0 since otherwise we would have to re-define the prior 
     # for every choice of kernel parameter, 
     total_dimension = problem.gaussian_dimension +
-                    problem.kernel_parameter_dimension
+                      problem.kernel_parameter_dimension
     μ0 = zeros(total_dimension)
     Σ0 = diagm(ones(total_dimension))
     prior = MvNormal(μ0, Σ0)
@@ -177,7 +210,7 @@ function standard_fubar_distance_function(grid::FUBARGrid, i, j)
     end
 
     return (grid.alpha_ind_vec[i] - grid.alpha_ind_vec[j])^2 +
-            (grid.beta_ind_vec[i] - grid.beta_ind_vec[j])^2
+           (grid.beta_ind_vec[i] - grid.beta_ind_vec[j])^2
 end
 
 function quintic_smooth_transition(x, alpha, beta)
@@ -304,21 +337,21 @@ and processes the samples to generate posterior probabilities of selection.
 
 If no supression type is provided, a default one is constructed based on the grid dimensions
 with a fifth degree polynomial is used"""
-function FUBAR_analysis(method::SKBDIFUBAR, grid::FUBARGrid{T}; 
-    analysis_name = "skbdi_fubar_analysis", 
-    volume_scaling = 1.0,
-    exports = true,
-    verbosity = 1,
-    posterior_threshold = 0.95,
-    distance_function = standard_fubar_distance_function,
-    kernel_function = (d, c) -> exp(-d / c^2),
-    kernel_parameter_dimension = 1,
-    supression_type = nothing,
-    m = 10, 
-    ϵ = 1e-6, 
-    n_samples = 1000, 
-    burnin = 200,
-    thinning = 50) where {T}
+function FUBAR_analysis(method::SKBDIFUBAR, grid::FUBARGrid{T};
+    analysis_name="skbdi_fubar_analysis",
+    volume_scaling=1.0,
+    exports=true,
+    verbosity=1,
+    posterior_threshold=0.95,
+    distance_function=standard_fubar_distance_function,
+    kernel_function=(d, c) -> exp(-d / c^2),
+    kernel_parameter_dimension=1,
+    supression_type=nothing,
+    m=10,
+    ϵ=1e-6,
+    n_samples=1000,
+    burnin=200,
+    thinning=50) where {T}
 
     @assert n_samples > burnin
     if isnothing(supression_type)
@@ -334,35 +367,35 @@ function FUBAR_analysis(method::SKBDIFUBAR, grid::FUBARGrid{T};
             supression_dimensions,
             quintic_smooth_transition)
     end
-    
-    model = define_gaussian_model(grid, 
-        distance_function = distance_function,
-        kernel_function = kernel_function,
-        kernel_parameter_dimension = kernel_parameter_dimension,
-        supression_type = supression_type)
 
-    samples, kernel_samples = sample_gaussian_model(model, 
-        m = m, 
-        n_samples = n_samples,
-        burnin = burnin)
+    model = define_gaussian_model(grid,
+        distance_function=distance_function,
+        kernel_function=kernel_function,
+        kernel_parameter_dimension=kernel_parameter_dimension,
+        supression_type=supression_type)
 
-    θ = gaussian_sample_postprocessing(model, samples; 
-        thinning = thinning, 
-        m = m)
+    samples, kernel_samples = sample_gaussian_model(model,
+        m=m,
+        n_samples=n_samples,
+        burnin=burnin)
 
-    analysis = FUBAR_tabulate_from_θ(method, θ, kernel_samples, grid, analysis_name, posterior_threshold = posterior_threshold, volume_scaling = volume_scaling, verbosity = verbosity, exports = exports)
-    return analysis, (θ = θ, kernel_samples = kernel_samples)
+    θ = gaussian_sample_postprocessing(model, samples;
+        thinning=thinning,
+        m=m)
+
+    analysis = FUBAR_tabulate_from_θ(method, θ, kernel_samples, grid, analysis_name, posterior_threshold=posterior_threshold, volume_scaling=volume_scaling, verbosity=verbosity, exports=exports)
+    return analysis, (θ=θ, kernel_samples=kernel_samples)
 end
 
-function FUBAR_tabulate_from_θ(method::SKBDIFUBAR, θ, kernel_samples, grid::FUBARGrid, analysis_name; posterior_threshold = 0.95, volume_scaling = 1.0, verbosity = 1, exports = true)
+function FUBAR_tabulate_from_θ(method::SKBDIFUBAR, θ, kernel_samples, grid::FUBARGrid, analysis_name; posterior_threshold=0.95, volume_scaling=1.0, verbosity=1, exports=true)
     results = FUBAR_bayesian_postprocessing(θ, grid, kernel_samples)
-    analysis = FUBAR_tabulate_results(method, results,grid,analysis_name = analysis_name, posterior_threshold = posterior_threshold, verbosity = verbosity, exports = exports)
-    FUBAR_plot_results(PlotsExtDummy(), method, results, grid, analysis_name = analysis_name, posterior_threshold = posterior_threshold, volume_scaling = volume_scaling, exports = exports)
+    analysis = FUBAR_tabulate_results(method, results, grid, analysis_name=analysis_name, posterior_threshold=posterior_threshold, verbosity=verbosity, exports=exports)
+    FUBAR_plot_results(PlotsExtDummy(), method, results, grid, analysis_name=analysis_name, posterior_threshold=posterior_threshold, volume_scaling=volume_scaling, exports=exports)
     return analysis
 end
 
-function FUBAR_tabulate_results(method::SKBDIFUBAR,results::BayesianFUBARResults, grid::FUBARGrid; analysis_name = "skbdi_fubar_analysis", posterior_threshold = 0.95, verbosity = 1, exports = true)
-    return FUBAR_tabulate_results(DefaultBayesianFUBARMethod(), results,grid, analysis_name = analysis_name, posterior_threshold = posterior_threshold, verbosity = verbosity, exports = exports)
+function FUBAR_tabulate_results(method::SKBDIFUBAR, results::BayesianFUBARResults, grid::FUBARGrid; analysis_name="skbdi_fubar_analysis", posterior_threshold=0.95, verbosity=1, exports=true)
+    return FUBAR_tabulate_results(DefaultBayesianFUBARMethod(), results, grid, analysis_name=analysis_name, posterior_threshold=posterior_threshold, verbosity=verbosity, exports=exports)
 end
 
 ## HERE ENDS INTEGRATION WITH THE FUBAR INTERACE

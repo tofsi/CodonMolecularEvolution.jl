@@ -5,7 +5,7 @@ function apply_smoothing(grid_sizes::Tuple, ambient_parameters::AbstractVector{<
     return unreshape_probability_vector(grid_sizes, smoothed_parameter_array)
 end
 
-function gaussian_kernel(window_size::Int64, variance::Float64)
+function gaussian_kernel(window_size::Int64, variance::Real)
     # window_size should be odd for symmetry, but not mandatory
     radius = (window_size - 1) ÷ 2
     x = -radius:radius                  # symmetric points centered at zero
