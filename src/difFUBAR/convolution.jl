@@ -5,12 +5,20 @@ function apply_smoothing(grid_sizes::Tuple, ambient_parameters::AbstractVector{<
     return unreshape_probability_vector(grid_sizes, smoothed_parameter_array)
 end
 
+function fubar_apply_smoothing(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real})
+    ambient_parameter_array = reshape_probability_vector(grid_sizes, codon_param_index_vec, ambient_parameters)
+    kernel = gaussian_kernel(5, kernel_parameters[1]^2) #approximate_gaussian_kernel(kernel_parameters[1]^2, 4)
+    smoothed_parameter_array = apply_separable_convolution(ambient_parameter_array, kernel)
+    #smoothed_parameter_array = ambient_parameter_array
+    return unreshape_probability_vector(codon_param_index_vec, smoothed_parameter_array)
+end
+
 function gaussian_kernel(window_size::Int64, variance::Real)
     # window_size should be odd for symmetry, but not mandatory
     radius = (window_size - 1) ÷ 2
     x = -radius:radius                  # symmetric points centered at zero
     kernel = exp.(-(x .^ 2) ./ (2 * variance))  # element-wise Gaussian formula
-    kernel /= sqrt(sum(kernel .^ 2))               # This is to make the variance not depend on smoothing
+    kernel /= sqrt(sum(kernel .^ 2))               # This is to make the variance not depend on smoothing TODO: But on the edges this is a bit of a problem?
     return kernel
 end
 
@@ -87,7 +95,9 @@ function same_conv(col, kernel)
     klen = length(kernel)
     left = fld(klen - 1, 2)
     right = cld(klen - 1, 2)
-    padded = vcat(zeros(left), col, zeros(right))
+    #padded = vcat(zeros(left), col, zeros(right)) # Padding with edge values makes sense here I think, because our best guess at the values directly outside of the grid should be the values at the edge of the grid.
+    padded = vcat(reverse(col[2:left+1]), col, reverse(col[end-right:end-1])) # TODO: What is the best behaviour when padding? A bit of a cursed solution would be to pad with more theta values.
+
     conv_result = conv_pure(padded, kernel)
     return conv_result
 end
