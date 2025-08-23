@@ -23,18 +23,18 @@ struct GeneralizedFUBARModel
     con_lik_matrix::Matrix{Float64}
 end
 
-
 function log_posterior(model::GeneralizedFUBARModel, parameters::AbstractVector{<:Real})
+    # log_posterior = log_prior + log_likelihood up to an additive constant
     return model.log_likelihood(parameters) + logpdf(model.prior, parameters)
 end
 
-
-
+"""
+FUBARLogDensity
+This struct implements the LogDensityProblems interface for the FUBAR model.
+"""
 struct FUBARLogDensity
     model::GeneralizedFUBARModel
 end
-
-#import LogDensityProblems: logdensity, dimension
 
 function LogDensityProblems.logdensity(p::FUBARLogDensity, parameters::AbstractVector{<:Real})
     return log_posterior(p.model, parameters)
@@ -49,31 +49,27 @@ function LogDensityProblems.capabilities(::Type{FUBARLogDensity})
 end
 
 
-
+"""
+# sample_NUTS()
+Samples from the model using NUTS
+## Arguments:
+- model::GeneralizedFUBARModel: The model to sample from.
+- iters::Int64: The number of iterations to sample.
+- n_chains::Int64: The number of chains to use for sampling.
+- progress::Bool: Whether to show progress bars.
+## Returns:
+- ambient_samples::Vector{Any}: The sampled parameter values. Indexed as 
+- stats::Any: The sampling statistics.
+"""
 function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64; progress=false)
-    """
-    Samples from the model using NUTS.
-    """
 
     initial_parameters = rand(model.prior)
     target = FUBARLogDensity(model)
-    #ad_target = LogDensityProblemsAD.ZygoteGradientLogDensity(target)
-
-    #ad_target = ADgradient(:Zygote, target)
     metric = DiagEuclideanMetric(model.n_parameters)
-    #logdensity = parameters -> log_posterior(model, parameters)
-    # grad_logdensity = parameters -> Zygote.gradient(logdensity, parameters)[1]
-    hamiltonian = Hamiltonian(metric, target, AutoMooncake(; config=nothing)) # We use zygote because it is good for the case R^n → R JK Zygote doesn't want to function lolllll
-    # hamiltonian = Hamiltonian(metric, ad_target) # We use zygote because it is good for the case R^n → R 
-
+    hamiltonian = Hamiltonian(metric, target, AutoMooncake(; config=nothing)) # We use mooncake because it is good for the case R^n → R
     n_adapts = div(iters, 10) # Number of adaptation steps, Default is min(1000, div(iters, 10))
-    #println(LogDensityProblems.logdensity_and_gradient(LogDensityProblems.logdensity, initial_parameters) |> typeof)
-    #println(typeof(LogDensityProblems.logdensity_and_gradient(LogDensityProblems.logdensity, initial_parameters)))
-
-    #println(typeof(LogDensityProblems.logdensity_and_gradient(ad_target, initial_parameters)))
     print("finding good epsilon...\n")
     epsilon = find_good_stepsize(hamiltonian, initial_parameters)
-    #epsilon = 0.2
     integrator = Leapfrog(epsilon)
     print("Epsilon used: ", epsilon, "\n")
     ambient_samples = Vector{Any}(undef, n_chains)
@@ -81,11 +77,6 @@ function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64
     adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
     stats = nothing
     if n_chains > 1
-        #= Threads.@threads for i in 1:n_chains
-            initial_parameters = rand(model.prior)
-            samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false)
-            ambient_samples[i] = samples
-        end =#
         Threads.@sync for i in 1:n_chains
             Threads.@spawn begin
                 local_initial = rand(model.prior)
@@ -121,10 +112,12 @@ a general skbdi model.
                        in the parameter grids for each category.
 - ambient_to_parameter_transform: A function that transforms an ambient sample into the parameter space.
 - kernel_dim: The number of kernel parameters.
+- grid_sizes: A tuple of integers representing the sizes of the grids for each parameter.
 - masks: The disjoint masks used by the model when applying suppression parameters.
 - suppression_dim: The number of suppression parameters.
 - unsuppressed_dim: The number of unsuppressed parameters.
 - total_dim: The total number of parameters in the model.
+- n_codon_parameters: The number of codon parameters (e.g. alpha, beta, omega_1) in the model.
 """
 struct SKBDIModel
     # Model Parameters:
@@ -145,9 +138,14 @@ struct SKBDIModel
     suppression_dim::Int64
     unsuppressed_dim::Int64
     total_dim::Int64
-    n_rate_parameters::Int64
+    n_codon_parameters::Int64
 end
 
+
+"""
+# GeneralizedFUBARModel(model::SKBDIModel)
+Constructor for creating a GeneralizedFUBARModel from a SKBDIModel.
+"""
 function GeneralizedFUBARModel(model::SKBDIModel)
     return GeneralizedFUBARModel(
         model.total_dim,
@@ -159,13 +157,18 @@ function GeneralizedFUBARModel(model::SKBDIModel)
 end
 
 """
-# generate_mutually_exclusive_masks
+# gen_disjoint_masks()
 generates additional suppression masks for each non-empty combination of hypotheses
+## Arguments:
+hypothesis_masks::Matrix{Bool}: The original hypothesis masks. Indexed mask[hypothesis, category] = true if the hypothesis is true for the category.
+## Returns:
+disjoint_masks::Array{Bool}: The generated disjoint masks, indexed [mask, category].
+mask_subset_indicators::Matrix{Bool}: mask_subset_indicators[mask, hypothesis] == true if the hypothesis is true for this mask.
 """
 function gen_disjoint_masks(hypothesis_masks::Matrix{Bool})
     disjoint_masks = Vector{Bool}[]
     mask_subset_indicators = Vector{Bool}[]
-    # Go through subsets (grows super fast with number of hypotheses)
+    # Go through subsets WARNING: grows super fast with number of hypotheses
     for i = 1:(2^(size(hypothesis_masks, 1))-1)
         b = [(i >> (j - 1) & 1) == 1 for j = 1:size(hypothesis_masks, 1)]
         # u (⋃_{j:b_j == 1} masks[j])∖(⋂_{j:b_j==0} masks[j])
@@ -178,6 +181,11 @@ function gen_disjoint_masks(hypothesis_masks::Matrix{Bool})
     return collect(hcat(disjoint_masks...)'), collect(hcat(mask_subset_indicators...)')
 end
 
+"""
+SKBDIModel constructor
+Creates a SKBDIModel given a set of parameters (upto "derived fields" in the struct docstring).
+See above docstring for field descriptions.
+"""
 function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     parameter_names::Vector{String},
     hypothesis_masks::Matrix{Bool},
@@ -193,7 +201,7 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     suppression_dim = size(hypothesis_masks)[1]
     unsuppressed_dim = size(log_con_lik_matrix)[1]
     total_dim = kernel_dim + suppression_dim + unsuppressed_dim
-    n_rate_parameters = length(grid_sizes)
+    n_codon_parameters = length(grid_sizes)
 
     return SKBDIModel(parameter_grids,
         parameter_names,
@@ -211,9 +219,14 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
         suppression_dim,
         unsuppressed_dim,
         total_dim,
-        n_rate_parameters)
+        n_codon_parameters)
 end
 
+"""
+# reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
+Takes a vector with index according to codon_param_index_vec 
+and returns the corresponding multidimensional array with shape according to grid sizes.
+"""
 function reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
     probability_array = zeros(Float64, grid_sizes)
     for (i, grid_point) in enumerate(codon_param_index_vec)
@@ -222,6 +235,10 @@ function reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Ve
     return probability_array
 end
 
+"""
+# unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
+Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
+"""
 function unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
     probability_vector = zeros(Float64, length(codon_param_index_vec))
     for (i, grid_point) in enumerate(codon_param_index_vec)
@@ -230,21 +247,32 @@ function unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64
     return probability_vector
 end
 
-# To match the grid as generated by the difFUBAR functions.
+"""
+# reshape_probability_vector(grid_sizes::Tuple, probability_vector::AbstractVector{<:Real})
+Takes a vector with index according to codon_param_index_vec and reshapes it into a multidimensional array based on the grid sizes.
+NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid(), but is fast and AD safe
+"""
 function reshape_probability_vector(grid_sizes::Tuple, probability_vector::AbstractVector{<:Real})
     return permutedims(reshape(probability_vector, reverse(grid_sizes)...),
         reverse(1:length(grid_sizes)))
 end
 
+"""
+# unreshape_probability_vector()
+Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
+NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid, but is fast and AD safe
+"""
 function unreshape_probability_vector(grid_sizes::Tuple, probability_array::AbstractArray{<:Real})
     return vec(permutedims(probability_array, reverse(1:length(grid_sizes))))
 end
 
-
+"""
+# split_parameters(model::SKBDIModel, parameters::AbstractVector{<:Real})
+Splits the parameters into kernel, suppression, and unsuppressed parameters according to the model.
+The parameters are assumed to be in the order: kernel, suppression, unsuppressed with lengths
+model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
+"""
 function split_parameters(model::SKBDIModel, parameters::AbstractVector{<:Real})
-    """
-    Splits the parameters into kernel, suppression, and unsuppressed parameters.
-    """
 
     begin
         kernel_parameters = parameters[1:model.kernel_dim]
@@ -254,13 +282,14 @@ function split_parameters(model::SKBDIModel, parameters::AbstractVector{<:Real})
     return kernel_parameters, suppression_parameters, unsuppressed_parameters
 end
 
+"""
+# to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64})
+Computes the probability vector for the model given the parameters (ambient_sample).
+Parameters are assumed to be in the order: kernel, suppression, unsuppressed with lengths matching
+model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
+"""
 function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64})
-    """
-    Computes the probability vector for the model given the parameters.
-    parameters start with kernel parameters, followed by suppression parameters, 
-    and then unsuppressed parameters.
-    TODO: we wanna return the minimum of suppression params in case of overlap probably, not multiplying them
-    """
+
     parameters = model.ambient_to_parameter_transform(ambient_sample)
     _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
     probability_vector = softmax(unsuppressed_parameters)
@@ -268,7 +297,6 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
     transition_function_values = model.transition_function.(suppression_parameters)
     for i in 1:size(model.masks, 1)
         # In the case of hypothesis overlap, we take the minimum of the transition functions
-
         mask = model.masks[i, :]
         suppression_factor = minimum(
             transition_function_values[model.mask_subset_indicators[i, :]])
@@ -279,14 +307,35 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
     return any(probability_vector .> 0.0) ? probability_vector ./ sum(probability_vector) : probability_vector
 end
 
+"""
+# log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
+Computes the log-likelihood of the model given the parameters (ambient_sample).
+The parameters are assumed to be in the order: kernel, suppression, unsuppressed with lengths matching
+model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
+"""
 function log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
-    """
-    Computes the log-likelihood of the model given the parameters.
-    """
     probability_vector = to_probability_vector(model, ambient_sample)
     return sum(log.(model.con_lik_matrix' * probability_vector))
 end
 
+"""
+# fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
+Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
+NOTE: This is identical to the below grid_based_ambient_to_parameter_transform, but uses the fubar_apply_smoothing function.
+TODO: make this and the below function into only one function using multiple dispatch.
+The main difference is the reshaping operation.
+## Parameters:
+ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
+grid_sizes::Tuple: The sizes of the parameter grids.
+codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
+kernel_dim::Int64: The dimensionality of the kernel parameters.
+suppression_dim::Int64: The dimensionality of the suppression parameters.
+kernel_stddev::Float64: The standard deviation for the kernel parameters.
+suppression_stddev::Float64: The standard deviation for the suppression parameters.
+## Returns:
+AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
+(kernel_parameters, suppression_parameters, unsuppressed_parameters).
+"""
 function fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
     kernel_parameters = ambient_sample[1:kernel_dim]
     suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
@@ -296,44 +345,23 @@ function fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:R
     return vcat(kernel_parameters, suppression_parameters, fubar_apply_smoothing(grid_sizes, codon_param_index_vec, ambient_unsuppressed_parameters, kernel_parameters))
 end
 
-function hedwigs_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, kernel_function::Function, epsilon::Float64=1e-6)
-    """
-    Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-    """
-    kernel_parameters = ambient_sample[1:kernel_dim]
-    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
-    unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
-    kernel_parameters = kernel_stddev * kernel_parameters
-    suppression_parameters = suppression_stddev * suppression_parameters
-    covariance_matrix = kernel_function(kernel_parameters, square_distance_matrix) + epsilon * I # Tykhonoff regularization
-    unsuppressed_parameters = CodonMolecularEvolution.krylov_sqrt_times_vector(covariance_matrix,
-        unsuppressed_parameters)
-
-    #unsuppressed_parameters = cholesky(covariance_matrix).L * unsuppressed_parameters
-    res = vcat(kernel_parameters, suppression_parameters, unsuppressed_parameters)
-    return res
-end
-
-function toves_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64, square_distance_matrix::Matrix{Int64}, weight_function::Function)
-    """
-    Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-    """
-
-    kernel_parameters = ambient_sample[1:kernel_dim]
-    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
-    ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
-    kernel_parameters = kernel_stddev * kernel_parameters
-    suppression_parameters = suppression_stddev * suppression_parameters
-    weight_matrix = weight_function(kernel_parameters, square_distance_matrix)
-
-    return vcat(kernel_parameters, suppression_parameters, vec((weight_matrix * ambient_unsuppressed_parameters)))
-end
-
-# Leverage the grid structure and use gaussian blur
+"""
+# ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
+Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
+## Parameters:
+ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
+grid_sizes::Tuple: The sizes of the parameter grids.
+codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
+kernel_dim::Int64: The dimensionality of the kernel parameters.
+suppression_dim::Int64: The dimensionality of the suppression parameters.
+kernel_stddev::Float64: The standard deviation for the kernel parameters.
+suppression_stddev::Float64: The standard deviation for the suppression parameters.
+## Returns:
+AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
+(kernel_parameters, suppression_parameters, unsuppressed_parameters).
+"""
 function grid_based_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
-    """
-    Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-    """
+
     kernel_parameters = ambient_sample[1:kernel_dim]
     suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
     ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
@@ -343,44 +371,24 @@ function grid_based_ambient_to_parameter_transform(ambient_sample::AbstractVecto
     #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters)
 end
 
-function toves_weight_function(c::AbstractVector{<:Real}, square_distance_matrix::Matrix{Int64})
-    """
-    A fast implementation of Tove's weight function.
-    """
-    res = exp(-1 / c[1]^2) .^ (square_distance_matrix)
-    return res ./ sqrt.(sum(res .^ 2, dims=2))
-end
-
-function fast_cov_mat_hedwigs_kernel(c::AbstractVector{<:Real}, square_distance_matrix::Matrix{Int64})
-    """
-    A fast implementation of Hedwig's kernel for the covariance matrix.
-    """
-    return exp(-c[1]^2) .^ square_distance_matrix
-end
-
-function generate_square_l2_distance_matrix(codon_param_index_vec::Vector{Vector{Int64}})
-    """
-    Generates a square matrix of L2 distances between the categories.
-    """
-    num_categories = length(codon_param_index_vec)
-    square_distance_matrix = zeros(Int64, num_categories, num_categories)
-    for i in 1:num_categories
-        for j in 1:i
-            # Note: The following fails if i, j are not the same length.
-            square_distance_matrix[i, j] = sum((codon_param_index_vec[i] .- codon_param_index_vec[j]) .^ 2)
-            square_distance_matrix[j, i] = square_distance_matrix[i, j]  # Symmetric matrix
-        end
-    end
-    return square_distance_matrix
-end
-
+"""
+# calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,ambient_samples::Vector{Vector{Float64}}, burnin::Int; progress=false)
+Samples the allocation grid used for site-wise inference from the ambient samples 
+(see the other diffubar files for details about how alloc_grid is used.)
+TODO: Find a way to make this faster!
+## Parameters:
+- model::GeneralizedFUBARModel: The model to use for the transformation.
+- ambient_samples::Vector{Vector{Float64}}: The ambient samples to transform.
+- burnin::Int: The burn-in period for the MCMC sampler.
+- progress::Bool: Whether to show progress updates.
+## Returns:
+- alloc_grid::Matrix{Int64}: The allocation grid for site-wise inference
+- theta::Vector{Float64}: The estimated posterior probability vector for the model.
+"""
 function calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,
     ambient_samples::Vector{Vector{Float64}},
     burnin::Int; progress=false)
-    """
-    Samples the allocation grid from the ambient samples
-    TODO: WHY DOES THIS TAKE SO MUCH TIME x_x
-    """
+
     n_samples = size(ambient_samples, 1)
     n_sites = size(model.con_lik_matrix, 2)
     alloc_grid = zeros(Int64, size(model.con_lik_matrix))
@@ -571,8 +579,9 @@ end
 
 struct GRIDFUBAR <: CodonMolecularEvolution.BayesianFUBARMethod end
 
-function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
-    analysis_name="skbdi_f ubar_analysis",
+"""
+    FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
+    analysis_name="grid_skbdi_fubar_analysis",
     volume_scaling=1.0,
     exports=true,
     verbosity=1,
@@ -580,9 +589,44 @@ function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
     m=10,
     ϵ=1e-6,
     iters=1000,
-    burnin=div(iters, 4),
-    thinning=50,
-    progress=false) where {T}
+    burnin=div(iters, 4)) where {T}
+
+Perform a Fast Unconstrained Bayesian AppRoximation (FUBAR) analysis using the SKBDI (Smooth Kernel Bayesian Density Inference) approach.
+
+# Arguments
+- `method::SKBDIFUBAR`: Empty struct used for dispatch
+- `grid::FUBARGrid{T}`: Grid to perform inference on
+
+# Keywords
+- `analysis_name::String="grid_skbdi_fubar_analysis"`: Name for the analysis output files and directory
+- `volume_scaling::Float64=1.0`: Controls the scaling of the marginal parameter violin plots
+- `exports::Bool=true`: Whether to export results to files
+- `verbosity::Int=1`: Control level of output messages (0=none, higher values=more details)
+- `posterior_threshold::Float64=0.95`: Posterior probability threshold for classification
+- `iters::Int=1000`: Number of MCMC samples to generate
+- `burnin=div(iters, 4)`: Number of initial samples to neglect when computing posterior summaries
+
+# Returns
+- A tuple containing:
+    - `analysis`: DataFrame with FUBAR analysis results
+    - `ambient_samples`: Posterior samples in ambient space
+    - `theta`: Posterior samples of the probability vector
+    - `theta_array`: Posterior samples of the reshaped probability vector as an array
+
+# Description
+This function increments upon the method found in the gaussian_fubar.jl file in src/FUBAR using grid based smoothing 
+with Gaussian blur instead of Krylov subspace methods.
+"""
+function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
+    analysis_name="grid_skbdi_fubar_analysis",
+    volume_scaling=1.0,
+    exports=true,
+    verbosity=1,
+    posterior_threshold=0.95,
+    m=10,
+    ϵ=1e-6,
+    iters=1000,
+    burnin=div(iters, 4)) where {T}
 
     codon_param_index_vec = [[grid.alpha_ind_vec[i], grid.beta_ind_vec[i]] for i = 1:length(grid.alpha_ind_vec)]
     codon_param_vec = [[grid.alpha_vec[i], grid.beta_vec[i]] for i in 1:length(grid.alpha_vec)]
@@ -594,13 +638,8 @@ function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
     hypothesis_masks[1, :] = [c[2] > c[1] for c in codon_param_vec] # beta > alpha
     transition_function = s -> CodonMolecularEvolution.quintic_smooth_transition(s, 0.0, 1.0)
     suppression_stddev = 2.0
-    kernel_stddev = 10.0
+    kernel_stddev = 4.0
     grid_dimension = length(grid.grid_values)
-
-    #fubar_to_ambient = CodonMolecularEvolution.get_fubar_to_ambient_permutation(grid_dimension)
-    #ambient_to_fubar = CodonMolecularEvolution.get_ambient_to_fubar_permutation(grid_dimension)
-    #permuted_cond_lik_matrix = grid.cond_lik_matrix[:, ambient_to_fubar]
-
     model = SKBDIModel(parameter_grids,
         ["alpha", "beta"],
         hypothesis_masks,
@@ -613,19 +652,6 @@ function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
         1,
         grid_sizes
     )
-    println(size(model.masks))
-
-    #= for i = 1:100
-        p_vec = rand(length(codon_param_vec))
-        permuted_p_vec = p_vec[ambient_to_fubar]
-        ll1 = sum(log.(permuted_p_vec'grid.cond_lik_matrix))
-        ll2 = sum(log.(model.con_lik_matrix' * p_vec))
-        if ll1 != ll2
-            println("BAD BAD BAD:", ll1, ll2)
-        end
-    end =#
-
-    #CodonMolecularEvolution.gaussian_fubar_loglikelihood()
     fubar_model = GeneralizedFUBARModel(model)
     ess_model = ESSModel(fubar_model.prior, fubar_model.log_likelihood)
     ambient_samples = AbstractMCMC.sample(ess_model, ESS(), iters, progress=true)
@@ -633,15 +659,37 @@ function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
     theta_array = [reshape_probability_vector(grid_sizes, codon_param_index_vec, t) for t in theta]
     kernel_samples = [[s[1]] for s in ambient_samples]
     analysis = CodonMolecularEvolution.FUBAR_tabulate_from_θ(CodonMolecularEvolution.SKBDIFUBAR(), theta[burnin+1:end], kernel_samples[burnin+1:end], grid, analysis_name, posterior_threshold=posterior_threshold, volume_scaling=volume_scaling, verbosity=verbosity, exports=exports)
-    #return analysis, (θ=θ, kernel_samples=kernel_samples)
     return (analysis, ambient_samples, theta, theta_array)
-    #analysis = FUBAR_tabulate_from_θ(method, θ, kernel_samples, grid, analysis_name, posterior_threshold=posterior_threshold, volume_scaling=volume_scaling, verbosity=verbosity, exports=exports)
-    #return analysis, (θ=θ, kernel_samples=kernel_samples)
 end
 
 
+"""
+# hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_param_vec::Vector{Vector{Float64}})
+Computes the posterior probabilities of the hypotheses given the allocation grid and codon parameter vector, for the diffubar method.
+"""
+function hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_param_vec::Vector{Vector{Float64}})
+    ω1 = [c[2] for c in codon_param_vec]
+    ω2 = [c[3] for c in codon_param_vec]
+    alpha_vec = [c[1] for c in codon_param_vec]
+    ω1_greater_filt = ω1 .> ω2
+    ω2_greater_filt = ω2 .> ω1
+    ω1_pos_filt = ω1 .> 1.0
+    ω2_pos_filt = ω2 .> 1.0
+    posterior_probabilities = zeros(size(alloc_grid, 2), 4)
+    for site in 1:size(alloc_grid, 2)
+        posterior_probabilities[site, 1] = sum(alloc_grid[ω1_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 2] = sum(alloc_grid[ω2_pos_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 3] = sum(alloc_grid[ω1_greater_filt, site]) / sum(alloc_grid[:, site])
+        posterior_probabilities[site, 4] = sum(alloc_grid[ω2_greater_filt, site]) / sum(alloc_grid[:, site])
+    end
+    return posterior_probabilities
+end
 
-function main()
+"""
+# diffubar_example()
+Runs the skbdifFUBAR analysis on the tiny Ace2 dataset.
+"""
+function diffubar_example()
     analysis_name = "output/Ace2"
     seqnames, seqs = read_fasta("../../test/data/Ace2_tiny/Ace2_tiny_tagged.fasta")
     treestring = readlines(open("../../test/data/Ace2_tiny/tiny_tagged_no_bg.tre"))[1]
@@ -671,46 +719,23 @@ function main()
     @save "output/model.jld2" model_dict
 end
 
-function main2()
+"""
+# fubar_example()
+Performs FUBAR analysis using grid based smoothing on the flu dataset.
+"""
+function fubar_example()
     outdir = "fubar"
     seqnames, seqs = read_fasta("../../test/data/flu/flu.fasta")
     treestring = readlines("../../test/data/flu/flu.tre")[1]
-    # Perform analysis
     fgrid = alphabetagrid(seqnames, seqs, treestring)
-    #method = SKBDIFUBAR()#DirichletFUBAR() # Standard FUBAR
     analysis, ambient_samples_fubar, theta_fubar, theta_array_fubar = FUBAR_analysis_grid_based(GRIDFUBAR(), fgrid, analysis_name=outdir * "/flu_grid_based", progress=true, iters=100000)
-    #fubar_df_hedwig, params_hedwig z= FUBAR_analysis(SKBDIFUBAR(), CodonMolecularEvolution.HEDWIG(), fgrid, analysis_name=outdir * "/flu_hedwig", progress=true, n_samples=2000);
-    #println(params_grid_based)
-    #println(size(params_grid_based))
     alpha_values = sort(unique(fgrid.alpha_vec))
     beta_values = sort(unique(fgrid.beta_vec))
-    #@save "output/fubar/ambient_samples.jld2" ambient_samples_fubar
     @save "output/fubar/ambient_samples.jld2" ambient_samples_fubar
     @save "output/fubar/theta.jld2" theta_fubar
     @save "output/fubar/theta_array.jld2" theta_array_fubar
     @save "output/fubar/alpha_values.jld2" alpha_values
     @save "output/fubar/beta_values.jld2" beta_values
-    #@save "output/fubar/params_hedwig.jld2" params_hedwig
-    #@save(fubar_df_grid_based, "")
 end
 
-function hypothesis_posterior_probabilities(alloc_grid::Matrix{Int64}, codon_param_vec::Vector{Vector{Float64}})
-    ω1 = [c[2] for c in codon_param_vec]
-    ω2 = [c[3] for c in codon_param_vec]
-    alpha_vec = [c[1] for c in codon_param_vec]
-    ω1_greater_filt = ω1 .> ω2
-    ω2_greater_filt = ω2 .> ω1
-    ω1_pos_filt = ω1 .> 1.0
-    ω2_pos_filt = ω2 .> 1.0
-    posterior_probabilities = zeros(size(alloc_grid, 2), 4)
-    for site in 1:size(alloc_grid, 2)
-        posterior_probabilities[site, 1] = sum(alloc_grid[ω1_pos_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 2] = sum(alloc_grid[ω2_pos_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 3] = sum(alloc_grid[ω1_greater_filt, site]) / sum(alloc_grid[:, site])
-        posterior_probabilities[site, 4] = sum(alloc_grid[ω2_greater_filt, site]) / sum(alloc_grid[:, site])
-    end
-    return posterior_probabilities
-end
-
-main2()
-#main()
+# diffubar_example()
