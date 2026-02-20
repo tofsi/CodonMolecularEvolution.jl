@@ -8,6 +8,7 @@ end
 
 export alphabeta_setup
 
+@doc ("""
 #These were derived from a Flu dataset
 const demo_f3x4 = [ 0.293117 0.184379 0.295274 0.190878;
                     0.342317 0.199907 0.154328 0.267101;
@@ -25,31 +26,11 @@ const demo_nucmat = [  -0.256236 0.0697056 0.152411 0.034119;
                             scale_total_tree_neutral_expected_subs = -1.0, outpath = "")
 
 Simulate a set of sequences under a given tree, with a set of alpha and beta values.
-f3x4 is a 3-by-4 matrix of position-specific nucleotide frequencies.
-nucmat is a 4-by-4 matrix of nucleotide substitution rates.
-If scale_total_tree_neutral_expected_subs > 0, then the tree is scaled so that if alpha=beta=1 for all sites, the expected number of neutral substitutions is equal to scale_total_tree_neutral_expected_subs.
-The sequences are written to a fasta file, and the tree is written to a newick file.
-"""
+""" * SHARED_SIMDOC)
 function sim_alphabeta_seqs(alphavec::Vector{Float64}, betavec::Vector{Float64}, singletree, nucmat::Array{Float64,2}, f3x4::Array{Float64,2};
                             scale_total_tree_neutral_expected_subs = -1.0, outpath = "")
     @assert length(alphavec) == length(betavec)
-    eq_freqs = MolecularEvolution.F3x4_eq_freqs(f3x4)
-    eq_partition = CodonPartition(1)
-    eq_partition.state .= eq_freqs
-    lazy_template = LazyPartition{CodonPartition}()
-    internal_message_init!(singletree, lazy_template)
-    direction = LazyDown(isleafnode)
-    lazyprep!(singletree, eq_partition, direction=direction)
-
-    if scale_total_tree_neutral_expected_subs > 0.0
-        total_bl = sum([n.branchlength for n in getnodelist(singletree)])
-        testmat = MolecularEvolution.MG94_F3x4(1.0, 1.0, nucmat, f3x4)
-        current_expected_neutral_subs = (-sum(eq_freqs .* diag(testmat)))*total_bl
-        scale = scale_total_tree_neutral_expected_subs/current_expected_neutral_subs
-        for n in getnodelist(singletree)
-            n.branchlength *= scale
-        end
-    end
+    direction = sim_init!(singletree, nucmat, f3x4, scale_total_tree_neutral_expected_subs=scale_total_tree_neutral_expected_subs)
 
     nucseq_collection = []
     for i in 1:length(alphavec)

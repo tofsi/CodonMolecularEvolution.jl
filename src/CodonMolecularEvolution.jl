@@ -6,6 +6,7 @@ using PDMats, BenchmarkTools
 using EllipticalSliceSampling
 using KrylovKit
 abstract type difFUBARGrid end
+abstract type BAMEgrid end #Bayesian Approaches to Mixed Effects
 struct PlotsExtDummy end
 
 include("shared/shared.jl")
@@ -16,6 +17,14 @@ include("difFUBAR/grids.jl")
 include("../test/benchmark_difFUBAR.jl")
 
 include("FUBAR/FUBAR.jl")
+include("smoothFUBAR/smoothFUBAR.jl")
+include("FLAVOR/FLAVOR.jl")
+
+include("MEME/MEME.jl")
+
+include("FAME/FAME.jl")
+
+include("simulations/simulations.jl")
 include("simulations/alphabeta/alphabeta.jl")
 include("simulations/ou_hb.jl")
 include("FUBAR/gaussianFUBAR.jl")
