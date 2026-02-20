@@ -2,13 +2,26 @@
 function alphabeta_setup(seqnames, seqs, treestring;
     verbosity=1, code=MolecularEvolution.universal_code, optimize_branch_lengths=false)
     tree, _ = FUBAR_init("", treestring, exports=false, verbosity=verbosity)
-    tree, alpha, beta, GTRmat, F3x4_freqs, eq_freqs = difFUBAR_global_fit_2steps(seqnames, seqs, tree, x -> x, code, verbosity=verbosity, optimize_branch_lengths=optimize_branch_lengths)
+    tree, LL, alpha, beta, GTRmat, F3x4_freqs, eq_freqs = difFUBAR_global_fit_2steps(seqnames, seqs, tree, x -> x, code, verbosity=verbosity, optimize_branch_lengths=optimize_branch_lengths)
     return tree, GTRmat, F3x4_freqs
 end
 
 export alphabeta_setup
 
 @doc ("""
+#These were derived from a Flu dataset
+const demo_f3x4 = [ 0.293117 0.184379 0.295274 0.190878;
+                    0.342317 0.199907 0.154328 0.267101;
+                    0.231987 0.217801 0.241637 0.272234]
+
+
+const demo_nucmat = [  -0.256236 0.0697056 0.152411 0.034119;
+                        0.0697056 -0.274119 0.0596187 0.144795;
+                        0.152411 0.0596187 -0.251381 0.0393506;
+                        0.034119 0.144795 0.0393506 -0.218264]
+
+
+"""
     sim_alphabeta_seqs(alphavec::Vector{Float64}, betavec::Vector{Float64}, singletree, nucmat::Array{Float64,2}, f3x4::Array{Float64,2};
                             scale_total_tree_neutral_expected_subs = -1.0, outpath = "")
 
