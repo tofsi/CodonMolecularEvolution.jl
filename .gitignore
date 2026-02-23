@@ -4,3 +4,7 @@
 /Manifest.toml
 /docs/build/
 test/timing*
+# The following are names of output folders which fill with junk when running code
+**/fubar/
+**/output/
+/test/data

@@ -7,18 +7,16 @@ function alphabeta_setup(seqnames, seqs, treestring;
 end
 
 export alphabeta_setup
-
-@doc ("""
 #These were derived from a Flu dataset
-const demo_f3x4 = [ 0.293117 0.184379 0.295274 0.190878;
-                    0.342317 0.199907 0.154328 0.267101;
-                    0.231987 0.217801 0.241637 0.272234]
+const demo_f3x4 = [0.293117 0.184379 0.295274 0.190878;
+    0.342317 0.199907 0.154328 0.267101;
+    0.231987 0.217801 0.241637 0.272234]
 
 
-const demo_nucmat = [  -0.256236 0.0697056 0.152411 0.034119;
-                        0.0697056 -0.274119 0.0596187 0.144795;
-                        0.152411 0.0596187 -0.251381 0.0393506;
-                        0.034119 0.144795 0.0393506 -0.218264]
+const demo_nucmat = [-0.256236 0.0697056 0.152411 0.034119;
+    0.0697056 -0.274119 0.0596187 0.144795;
+    0.152411 0.0596187 -0.251381 0.0393506;
+    0.034119 0.144795 0.0393506 -0.218264]
 
 
 """
@@ -26,25 +24,27 @@ const demo_nucmat = [  -0.256236 0.0697056 0.152411 0.034119;
                             scale_total_tree_neutral_expected_subs = -1.0, outpath = "")
 
 Simulate a set of sequences under a given tree, with a set of alpha and beta values.
-""" * SHARED_SIMDOC)
+"""
 function sim_alphabeta_seqs(alphavec::Vector{Float64}, betavec::Vector{Float64}, singletree, nucmat::Array{Float64,2}, f3x4::Array{Float64,2};
-                            scale_total_tree_neutral_expected_subs = -1.0, outpath = "")
+    scale_total_tree_neutral_expected_subs=-1.0, outpath="")
     @assert length(alphavec) == length(betavec)
     direction = sim_init!(singletree, nucmat, f3x4, scale_total_tree_neutral_expected_subs=scale_total_tree_neutral_expected_subs)
 
     nucseq_collection = []
     for i in 1:length(alphavec)
-        alpha,beta = alphavec[i], betavec[i]
+        alpha, beta = alphavec[i], betavec[i]
         m = DiagonalizedCTMC(MolecularEvolution.MG94_F3x4(alpha, beta, nucmat, f3x4))
         sample_down!(singletree, m)
         nucs_at_leaves = [n.message[1].obs for n in getleaflist(singletree)]
         push!(nucseq_collection, nucs_at_leaves)
         lazyprep!(singletree, direction) #This is needed for successive sample_down! calls
     end
-    nucseqs = prod(stack(nucseq_collection), dims = 2)[:]
+    nucseqs = prod(stack(nucseq_collection), dims=2)[:]
     if outpath != ""
-        write_fasta(outpath*".fasta", nucseqs, seq_names = [n.name for n in getleaflist(singletree)])
-        open(outpath*".tre", "a") do io write(io, newick(singletree)) end
+        write_fasta(outpath * ".fasta", nucseqs, seq_names=[n.name for n in getleaflist(singletree)])
+        open(outpath * ".tre", "a") do io
+            write(io, newick(singletree))
+        end
     end
     return nucseqs, [n.name for n in getleaflist(singletree)], singletree
 end

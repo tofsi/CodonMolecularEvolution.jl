@@ -17,7 +17,7 @@ include("difFUBAR/grids.jl")
 include("../test/benchmark_difFUBAR.jl")
 
 include("FUBAR/FUBAR.jl")
-include("smoothFUBAR/smoothFUBAR.jl")
+# include("smoothFUBAR/smoothFUBAR.jl")
 include("FLAVOR/FLAVOR.jl")
 
 include("MEME/MEME.jl")
@@ -30,7 +30,7 @@ include("simulations/ou_hb.jl")
 include("FUBAR/gaussianFUBAR.jl")
 include("FUBAR/grid_utilities.jl")
 
-export 
+export
     difFUBARBaseline,
     difFUBARParallel,
     difFUBARTreesurgery,
