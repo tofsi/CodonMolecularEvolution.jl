@@ -5,6 +5,7 @@ using NNlib, Distributions, SimpleUnPack, AbstractMCMC, Interpolations, MCMCChai
 using PDMats, BenchmarkTools
 using EllipticalSliceSampling
 using KrylovKit
+using Plots
 abstract type difFUBARGrid end
 abstract type BAMEgrid end #Bayesian Approaches to Mixed Effects
 struct PlotsExtDummy end
