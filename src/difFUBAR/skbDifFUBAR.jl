@@ -123,7 +123,7 @@ struct SKBDIModel
     # Model Parameters:
     parameter_grids::Vector{Vector{Float64}}
     parameter_names::Vector{String}
-    hypothesis_masks::Matrix{Bool}
+    hypothesis_masks::Union{Matrix{Bool},Nothing} # Allows for no suppression
     transition_function::Function
     log_con_lik_matrix::Matrix{Float64}
     con_lik_matrix::Matrix{Float64}
@@ -133,8 +133,8 @@ struct SKBDIModel
     kernel_dim::Int64
     grid_sizes::Tuple
     ## Derived fields:
-    masks::Matrix{Bool}
-    mask_subset_indicators::Matrix{Bool}
+    masks::Union{Matrix{Bool},Nothing} # nothing in case of no suppression
+    mask_subset_indicators::Union{Matrix{Bool},Nothing}
     suppression_dim::Int64
     unsuppressed_dim::Int64
     total_dim::Int64
@@ -188,7 +188,7 @@ See above docstring for field descriptions.
 """
 function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     parameter_names::Vector{String},
-    hypothesis_masks::Matrix{Bool},
+    hypothesis_masks::Union{Matrix{Bool},Nothing},
     transition_function::Function,
     log_con_lik_matrix::Matrix{Float64},
     con_lik_matrix::Matrix{Float64},
@@ -197,8 +197,15 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     ambient_to_parameter_transform::Function,
     kernel_dim::Int64,
     grid_sizes::Tuple)
-    masks, mask_subset_indicators = gen_disjoint_masks(hypothesis_masks)
-    suppression_dim = size(hypothesis_masks)[1]
+
+    masks = nothing
+    mask_subset_indicators = nothing
+    suppression_dim = 0
+    if hypothesis_masks !== nothing
+        masks, mask_subset_indicators = gen_disjoint_masks(hypothesis_masks)
+        suppression_dim = size(hypothesis_masks)[1]
+    end
+
     unsuppressed_dim = size(log_con_lik_matrix)[1]
     total_dim = kernel_dim + suppression_dim + unsuppressed_dim
     n_codon_parameters = length(grid_sizes)
@@ -293,8 +300,13 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
     parameters = model.ambient_to_parameter_transform(ambient_sample)
     _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
     probability_vector = softmax(unsuppressed_parameters)
+    if model.suppression_dim > 0 # The unsuppressed case
+        return probability_vector
+    end
+
     # Apply the transition functions for each suppression parameter
     transition_function_values = model.transition_function.(suppression_parameters)
+
     for i in 1:size(model.masks, 1)
         # In the case of hypothesis overlap, we take the minimum of the transition functions
         mask = model.masks[i, :]
@@ -304,6 +316,7 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
         # We do it this way because it makes AD happy :)
         probability_vector = probability_vector .* (suppression_factor .* mask .+ Float64.(.!mask))
     end
+
     return any(probability_vector .> 0.0) ? probability_vector ./ sum(probability_vector) : probability_vector
 end
 

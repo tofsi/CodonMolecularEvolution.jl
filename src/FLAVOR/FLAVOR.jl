@@ -6,13 +6,13 @@
 struct FLAVORgrid{T} <: BAMEgrid
     tr::Function
     trinv::Function
-    mugrid::Vector{T}
-    shapegrid::Vector{T}
-    alphagrid::Vector{T}
+    mugrid::Vector{T} # Grid of means of gamma distributions
+    shapegrid::Vector{T} # Grid of shapes of gamma distributions
+    alphagrid::Vector{T} # Grid of synonymous substitution rate values
     gridpoints::Vector{Tuple{T,T,T}}
     grid_dims::Vector{Int64}
-    prob_matrix::Matrix{T}
-    site_scalers::Vector{T}
+    prob_matrix::Matrix{T} # likelihood matrix indexed (category, site)
+    site_scalers::Vector{T} # per-site log normalizing constants
 end
 
 #We could perhaps generalize here with a BAMEgrid as well
@@ -178,12 +178,34 @@ end
 #Note: we exclude the sites where there were no categories with omega > 1, even if they are uncapped.
 get_pos_sel_mask(f::FLAVORgrid) = vcat(prop_pos.(f.gridpoints, false), prop_pos.(f.gridpoints, true)) .> 0.0 #[i <= l/2 for i in 1:l]
 
+function gen_BAME_plots(posterior_pos, bfs, pos_thresh)
+    #Posteriors:
+    scatter(posterior_pos, label=:none, xlabel="Codon sites", ylim=(0, 1), color=:rainbow_bgyr_35_85_c72_n256, colorbar=:none,
+        ylabel="P(β>α) for some branches", zcolor=posterior_pos .> pos_thresh, markerstrokewidth=0, size=(800, 300), margins=10Plots.mm)
+    for i in 1:length(posterior_pos)
+        if posterior_pos[i] > pos_thresh
+            annotate!([(i, posterior_pos[i], Plots.text(" $(i)", 8, :black, :left))])
+        end
+    end
+    savefig(outpath * "_SitePosteriors.pdf")
+
+    #Bayes factors:
+    scatter(bfs, label=:none, xlabel="Codon sites", color=:rainbow_bgyr_35_85_c72_n256, colorbar=:none,
+        ylabel="Bayes Factor", zcolor=bfs .> 10.0, markerstrokewidth=0, size=(800, 300), margins=10Plots.mm, yscale=:log10)
+    for i in 1:length(bfs)
+        if bfs[i] > 10.0
+            annotate!([(i, bfs[i], Plots.text(" $(i)", 8, :black, :left))])
+        end
+    end
+    savefig(outpath * "_SiteBayesFactors.pdf")
+end
+
 #BAME shouldn't live in FLAVOR.jl
 #Need to make this match the smoothFUBAR setup with the first argument controlling the method (EM, Gibbs, etc)
 function BAME(f::BAMEgrid, outpath; pos_thresh=0.9, verbosity=1, method=(sampler=:DirichletEM, concentration=0.1, iterations=2500), plots=true)
     l = size(f.prob_matrix, 1)
     num_sites = size(f.prob_matrix, 2)
-    θ = weightEM(f.prob_matrix, ones(l) ./ l, conc=method.concentration, iters=method.iterations)
+    θ = weightEM(f.prob_matrix, ones(l) ./ l, conc=method.concentration, iters=method.iterations) # Want to change this to something else.
 
     pos_sel_mask = get_pos_sel_mask(f)
     pos_prior = sum(pos_sel_mask .* θ)
@@ -200,27 +222,8 @@ function BAME(f::BAMEgrid, outpath; pos_thresh=0.9, verbosity=1, method=(sampler
     CSV.write(outpath * "_SelectionOutput.csv", df)
 
     if plots
-        #Posteriors:
-        scatter(posterior_pos, label=:none, xlabel="Codon sites", ylim=(0, 1), color=:rainbow_bgyr_35_85_c72_n256, colorbar=:none,
-            ylabel="P(β>α) for some branches", zcolor=posterior_pos .> pos_thresh, markerstrokewidth=0, size=(800, 300), margins=10Plots.mm)
-        for i in 1:length(posterior_pos)
-            if posterior_pos[i] > pos_thresh
-                annotate!([(i, posterior_pos[i], Plots.text(" $(i)", 8, :black, :left))])
-            end
-        end
-        savefig(outpath * "_SitePosteriors.pdf")
-
-        #Bayes factors:
-        scatter(bfs, label=:none, xlabel="Codon sites", color=:rainbow_bgyr_35_85_c72_n256, colorbar=:none,
-            ylabel="Bayes Factor", zcolor=bfs .> 10.0, markerstrokewidth=0, size=(800, 300), margins=10Plots.mm, yscale=:log10)
-        for i in 1:length(bfs)
-            if bfs[i] > 10.0
-                annotate!([(i, bfs[i], Plots.text(" $(i)", 8, :black, :left))])
-            end
-        end
-        savefig(outpath * "_SiteBayesFactors.pdf")
+        gen_BAME_plots(posterior_pos, bfs, pos_thresh)
     end
-
     if verbosity > 0
         for i in 1:length(posterior_pos)
             if posterior_pos[i] > pos_thresh
