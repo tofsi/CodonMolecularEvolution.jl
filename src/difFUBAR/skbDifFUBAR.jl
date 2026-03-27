@@ -358,30 +358,59 @@ function fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:R
     return vcat(kernel_parameters, suppression_parameters, fubar_apply_smoothing(grid_sizes, codon_param_index_vec, ambient_unsuppressed_parameters, kernel_parameters))
 end
 
+
 """
-# ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
-Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-## Parameters:
-ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
+GridBasedTransform
+An object that describes a callable transform from ambient space to parameter space
+Specifically, it is called to transform an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
+## Fields:
+
 grid_sizes::Tuple: The sizes of the parameter grids.
 codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
 kernel_dim::Int64: The dimensionality of the kernel parameters.
 suppression_dim::Int64: The dimensionality of the suppression parameters.
 kernel_stddev::Float64: The standard deviation for the kernel parameters.
-suppression_stddev::Float64: The standard deviation for the suppression parameters.
+suppression_stddev::Float64: The standard deviation for the suppression parameters."""
+struct GridBasedTransform
+    #grid_sizes::Tuple
+    kernel_dim::Int
+    suppression_dim::Int
+    kernel_stddev::Float64
+    suppression_stddev::Float64
+end
+
+"""
+# GridBasedTransform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
+Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
+## Parameters
+ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
 ## Returns:
 AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
 (kernel_parameters, suppression_parameters, unsuppressed_parameters).
 """
-function grid_based_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
+function (t::GridBasedTransform)(ambient_sample::AbstractVector{<:Real})
+    
+    k = t.kernel_dim
+    s = t.suppression_dim
 
-    kernel_parameters = ambient_sample[1:kernel_dim]
+    kernel_parameters = @view ambient_sample[1:k]
+    suppression_parameters = @view ambient_sample[k+1:k+s]
+    ambient_unsuppressed_parameters = @view ambient_sample[k+s+1:end]
+
+    return vcat(
+        t.kernel_stddev .* kernel_parameters,
+        t.suppression_stddev .* suppression_parameters,
+        ambient_unsuppressed_parameters,
+    )
+
+    #= kernel_parameters = ambient_sample[1:kernel_dim]
     suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
     ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
     kernel_parameters = kernel_stddev * kernel_parameters
     suppression_parameters = suppression_stddev * suppression_parameters
+    return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # For debugging only!
     return vcat(kernel_parameters, suppression_parameters, apply_smoothing(grid_sizes, ambient_unsuppressed_parameters, kernel_parameters))
-    #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters)
+    #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) =#
 end
 
 """
@@ -516,8 +545,7 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
             con_lik_matrix,
             codon_param_vec,
             codon_param_index_vec,
-            ambient_sample -> grid_based_ambient_to_parameter_transform(
-                ambient_sample,
+            GridBasedTransform(
                 grid_sizes,
                 1,
                 size(hypothesis_masks, 1),

@@ -117,21 +117,21 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
     size(meta.hypothesis_masks, 2) == n_categories || throw(DimensionMismatch("Hypothesis mask does not match con_lik_matrix."))
 
-    #=  ambient_to_parameter_transform = ambient_sample -> grid_based_ambient_to_parameter_transform(
-        ambient_sample,
-        grid_sizes,
-        1,
-        suppress ? 1 : 0,
-        kernel_stddev,
-        suppress ? suppression_stddev : 0.0) =#
+    ambient_to_parameter_transform = GridBasedTransform(
+    #meta.grid_sizes,
+    1,
+    suppress ? 1 : 0,
+    kernel_stddev,
+    suppress ? suppression_stddev : 0.0,
+    )
 
     # ambient_to_parameter_transform = identity
-    ambient_to_parameter_transform = FlavorIdentityTransform(
+    #= ambient_to_parameter_transform = FlavorIdentityTransform(
     kernel_dim,
     0,                  # suppression_dim
     kernel_stddev,
     suppression_stddev,
-    )
+    ) =#
     return SKBDIModel(
         meta.parameter_grids,
         meta.parameter_names,
