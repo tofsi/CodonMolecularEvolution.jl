@@ -85,7 +85,7 @@ function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64
             end
         end
     else
-        samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false, progress=false)
+        samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false, progress=progress)
         ambient_samples[1] = samples
     end
 
@@ -119,17 +119,17 @@ a general skbdi model.
 - total_dim: The total number of parameters in the model.
 - n_codon_parameters: The number of codon parameters (e.g. alpha, beta, omega_1) in the model.
 """
-struct SKBDIModel
+struct SKBDIModel{TF, AT}
     # Model Parameters:
     parameter_grids::Vector{Vector{Float64}}
     parameter_names::Vector{String}
     hypothesis_masks::Union{AbstractMatrix{Bool},Nothing} # Allows for no suppression
-    transition_function::Function
+    transition_function::TF
     log_con_lik_matrix::Matrix{Float64}
     con_lik_matrix::Matrix{Float64}
     codon_param_vec::Vector{Vector{Float64}}
     codon_param_index_vec::Vector{Vector{Int64}}
-    ambient_to_parameter_transform::Function
+    ambient_to_parameter_transform::AT
     kernel_dim::Int64
     grid_sizes::Tuple
     ## Derived fields:
@@ -194,7 +194,7 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     con_lik_matrix::Matrix{Float64},
     codon_param_vec::Vector{Vector{Float64}},
     codon_param_index_vec::Vector{Vector{Int64}},
-    ambient_to_parameter_transform::Function,
+    ambient_to_parameter_transform,
     kernel_dim::Int64,
     grid_sizes::Tuple)
 

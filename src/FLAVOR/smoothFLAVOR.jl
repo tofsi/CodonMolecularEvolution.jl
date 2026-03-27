@@ -73,6 +73,26 @@ function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
     )
 end
 
+# The following is for debugging purposes
+struct FlavorIdentityTransform
+    kernel_dim::Int
+    suppression_dim::Int
+    kernel_stddev::Float64
+    suppression_stddev::Float64
+end
+# and this...
+function (t::FlavorIdentityTransform)(ambient_sample::AbstractVector{<:Real})
+    kernel_parameters = ambient_sample[1:t.kernel_dim]
+    suppression_parameters = ambient_sample[t.kernel_dim+1:t.kernel_dim+t.suppression_dim]
+    ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
+
+    return vcat(
+        t.kernel_stddev .* kernel_parameters,
+        t.suppression_stddev .* suppression_parameters,
+        ambient_unsuppressed_parameters,
+    )
+end
+
 """
     SKBDIModel_from_FLAVOR(flavorgrid; kwargs...)
 
@@ -105,8 +125,13 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
         kernel_stddev,
         suppress ? suppression_stddev : 0.0) =#
 
-    ambient_to_parameter_transform = identity
-
+    # ambient_to_parameter_transform = identity
+    ambient_to_parameter_transform = FlavorIdentityTransform(
+    kernel_dim,
+    0,                  # suppression_dim
+    kernel_stddev,
+    suppression_stddev,
+    )
     return SKBDIModel(
         meta.parameter_grids,
         meta.parameter_names,
