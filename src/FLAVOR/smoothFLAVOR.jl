@@ -1,19 +1,17 @@
 using Distributions
+using StatsBase
+using DataFrames
+using CSV
 
 if !isdefined(@__MODULE__, :SKBDIModel)
-    include("skbDifFUBAR.jl")
+    include("../difFUBAR/skbDifFUBAR.jl")
 end
 
 if !isdefined(@__MODULE__, :FLAVORgrid)
     include("FLAVOR.jl")
 end
 
-function require_flavor_symbols()
-    needed = (:FLAVORgrid, :get_pos_sel_mask)
-    missing = [s for s in needed if !isdefined(@__MODULE__, s)]
-    isempty(missing) || error("smoothFLAVOR.jl requires FLAVOR.jl to be loaded. Missing symbols: $(join(string.(missing), ", ")).")
-    return nothing
-end
+
 
 """
     flavor_con_lik_matrix(flavorgrid; normalized=true)
@@ -42,8 +40,6 @@ Construct the category metadata needed by `SKBDIModel` in FLAVOR's own category 
 all uncapped grid points first, then all capped grid points.
 """
 function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
-    require_flavor_symbols()
-
     mugrid = Float64.(collect(getproperty(flavorgrid, :mugrid)))
     shapegrid = Float64.(collect(getproperty(flavorgrid, :shapegrid)))
     alphagrid = Float64.(collect(getproperty(flavorgrid, :alphagrid)))
@@ -64,7 +60,7 @@ function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
         end
     end
 
-    positive_selection_mask = Bool.(collect(get_pos_sel_mask(flavorgrid)))
+    positive_selection_mask = Bool.(collect(CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)))
     length(positive_selection_mask) == length(codon_param_vec) || throw(DimensionMismatch("Positive-selection mask does not match number of categories."))
 
     return (
@@ -83,12 +79,13 @@ end
 Construct an `SKBDIModel` directly from a `FLAVORgrid`.
 
 The single hypothesis mask corresponds to FLAVOR's own positive-selection-capable
-categories, as returned by `get_pos_sel_mask(flavorgrid)`.
+categories, as returned by `CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)`.
 """
 function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     normalized::Bool=true,
-    kernel_dim::Int=1,
+    kernel_dim::Int=0,
     kernel_stddev::Real=4.0,
+    suppress::Bool=false,
     suppression_stddev::Real=2.0,
     transition_function=s -> CodonMolecularEvolution.quintic_smooth_transition(s, 0.0, 1.0))
 
@@ -100,20 +97,20 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
     size(meta.hypothesis_masks, 2) == n_categories || throw(DimensionMismatch("Hypothesis mask does not match con_lik_matrix."))
 
-    ambient_to_parameter_transform = ambient_sample -> fubar_ambient_to_parameter_transform(
+    #=  ambient_to_parameter_transform = ambient_sample -> grid_based_ambient_to_parameter_transform(
         ambient_sample,
-        meta.grid_sizes,
-        meta.codon_param_index_vec,
-        kernel_dim,
-        size(meta.hypothesis_masks, 1),
-        Float64(kernel_stddev),
-        Float64(suppression_stddev),
-    )
+        grid_sizes,
+        1,
+        suppress ? 1 : 0,
+        kernel_stddev,
+        suppress ? suppression_stddev : 0.0) =#
+
+    ambient_to_parameter_transform = identity
 
     return SKBDIModel(
         meta.parameter_grids,
         meta.parameter_names,
-        meta.hypothesis_masks,
+        suppress ? meta.hypothesis_masks : nothing,
         transition_function,
         log_con_lik_matrix,
         con_lik_matrix,
@@ -132,4 +129,143 @@ Convenience constructor returning `GeneralizedFUBARModel(SKBDIModel_from_FLAVOR(
 """
 function GeneralizedFUBARModel_from_FLAVOR(flavorgrid::FLAVORgrid; kwargs...)
     return GeneralizedFUBARModel(SKBDIModel_from_FLAVOR(flavorgrid; kwargs...))
+end
+
+
+
+# same formula as in FLAVOR
+bayes_factor_bame_analog(posterior, prior) = (posterior / (1 - posterior)) / (prior / (1 - prior))
+
+function summarize_smoothFLAVOR_BAME(
+    flavorgrid,
+    fubar_model::GeneralizedFUBARModel,
+    ambient_samples::Vector;
+    burnin::Int,
+    pos_thresh::Float64=0.9,
+    sample_allocations::Bool=false,
+    progress::Bool=false,
+)
+    con_lik = fubar_model.con_lik_matrix
+    n_categories, n_sites = size(con_lik)
+
+    pos_sel_mask = CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)
+
+    posterior_mat = zeros(Float64, n_categories, n_sites)
+    θ_mean = zeros(Float64, n_categories)
+    alloc_grid = sample_allocations ? zeros(Int, n_categories, n_sites) : nothing
+
+    n_used = 0
+    v = zeros(Float64, n_categories)
+
+    p = progress ? ProgressMeter.Progress(sum(length(chain) - burnin for chain in ambient_samples);
+        desc="Summarizing posterior") : nothing
+
+    for chain in ambient_samples
+        for t in burnin+1:length(chain)
+            θ = fubar_model.to_probability_vector(chain[t])
+            θ_mean .+= θ
+            n_used += 1
+
+            for s in 1:n_sites
+                @inbounds v .= θ .* con_lik[:, s]
+                z = sum(v)
+
+                # Should not happen if con_lik columns are valid, but guard anyway
+                if z <= 0
+                    continue
+                end
+
+                @inbounds posterior_mat[:, s] .+= v ./ z
+
+                if sample_allocations
+                    k = sample(1:n_categories, Weights(v))
+                    alloc_grid[k, s] += 1
+                end
+            end
+
+            progress ? ProgressMeter.next!(p) : nothing
+        end
+    end
+
+    θ_mean ./= n_used
+    posterior_mat ./= n_used
+
+    posterior_probs = vec(sum(posterior_mat[pos_sel_mask, :], dims=1))
+
+    # BAME-like plug-in prior mass
+    pos_prior = sum(θ_mean[pos_sel_mask])
+
+    # avoid 0/1 blowups
+    eps = 1e-12
+    posterior_probs_clamped = clamp.(posterior_probs, eps, 1 - eps)
+    pos_prior_clamped = clamp(pos_prior, eps, 1 - eps)
+
+    bayes_factors = bayes_factor_bame_analog.(posterior_probs_clamped, pos_prior_clamped)
+
+    df = DataFrame(
+        site=1:n_sites,
+        posterior_prob_positive=posterior_probs,
+        bayes_factor=bayes_factors,
+        threshold=posterior_probs .> pos_thresh,
+    )
+
+    return (
+        df=df,
+        posterior_mat=posterior_mat,
+        posterior_probs=posterior_probs,
+        bayes_factors=bayes_factors,
+        θ_mean=θ_mean,
+        pos_prior=pos_prior,
+        pos_sel_mask=pos_sel_mask,
+        alloc_grid=alloc_grid,
+        n_used=n_used,
+    )
+end
+
+function smoothFLAVOR_BAME(
+    flavorgrid,
+    outpath;
+    pos_thresh=0.9,
+    iters=10,
+    burnin=div(iters, 4),
+    n_chains=4,
+    verbosity=1,
+    exports=true,
+    sample_allocations=false,
+)
+    sk_model = SKBDIModel_from_FLAVOR(flavorgrid)
+    fubar_model = GeneralizedFUBARModel(sk_model)
+
+    if verbosity > 0
+        println("Sampling from smoothFLAVOR with NUTS.")
+    end
+
+    ambient_samples, stats = sample_NUTS(fubar_model, iters, n_chains; progress=verbosity > 0)
+
+    summary = summarize_smoothFLAVOR_BAME(
+        flavorgrid,
+        fubar_model,
+        ambient_samples;
+        burnin=burnin,
+        pos_thresh=pos_thresh,
+        sample_allocations=sample_allocations,
+        progress=verbosity > 0,
+    )
+
+    if exports
+        CSV.write(outpath * "_smoothFLAVOR_BAME.csv", summary.df)
+    end
+
+    return summary.df, (
+        ambient_samples=ambient_samples,
+        fubar_model=fubar_model,
+        sk_model=sk_model,
+        posterior_mat=summary.posterior_mat,
+        θ_mean=summary.θ_mean,
+        posterior_probs=summary.posterior_probs,
+        bayes_factors=summary.bayes_factors,
+        pos_sel_mask=summary.pos_sel_mask,
+        alloc_grid=summary.alloc_grid,
+        stats=stats,
+    )
 end

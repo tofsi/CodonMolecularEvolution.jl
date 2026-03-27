@@ -26,14 +26,14 @@ function FLAVORgrid(seqnames::Vector{String}, seqs, treestring::String;
     tr(x) = max(0.0, 10^x - 0.05)
     trinv(x) = log10(x + 0.05)
 
-    mugrid = gridsetup(0.01, 16.0, 8, trinv, tr)
-    shapegrid = gridsetup(0.05, 20, 6, trinv, tr)
-    alphagrid = gridsetup(0.01, 10, 8, trinv, tr)
+    #mugrid = gridsetup(0.01, 16.0, 8, trinv, tr)
+    #shapegrid = gridsetup(0.05, 20, 6, trinv, tr)
+    #alphagrid = gridsetup(0.01, 10, 8, trinv, tr)
 
     #Tiny grid for testing:
-    #mugrid = gridsetup(0.01, 16.0, 3, trinv, tr) 
-    #shapegrid = gridsetup(0.05, 20, 3, trinv, tr)
-    #alphagrid = gridsetup(0.01, 10, 3, trinv, tr)
+    mugrid = gridsetup(0.01, 16.0, 3, trinv, tr)
+    shapegrid = gridsetup(0.05, 20, 3, trinv, tr)
+    alphagrid = gridsetup(0.01, 10, 3, trinv, tr)
 
     #mu, shape alpha
     gridpoints = [(mu, shape, alpha) for mu in mugrid for shape in shapegrid for alpha in alphagrid]

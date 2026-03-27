@@ -123,7 +123,7 @@ struct SKBDIModel
     # Model Parameters:
     parameter_grids::Vector{Vector{Float64}}
     parameter_names::Vector{String}
-    hypothesis_masks::Union{Matrix{Bool},Nothing} # Allows for no suppression
+    hypothesis_masks::Union{AbstractMatrix{Bool},Nothing} # Allows for no suppression
     transition_function::Function
     log_con_lik_matrix::Matrix{Float64}
     con_lik_matrix::Matrix{Float64}
@@ -133,8 +133,8 @@ struct SKBDIModel
     kernel_dim::Int64
     grid_sizes::Tuple
     ## Derived fields:
-    masks::Union{Matrix{Bool},Nothing} # nothing in case of no suppression
-    mask_subset_indicators::Union{Matrix{Bool},Nothing}
+    masks::Union{AbstractMatrix{Bool},Nothing} # nothing in case of no suppression
+    mask_subset_indicators::Union{AbstractMatrix{Bool},Nothing}
     suppression_dim::Int64
     unsuppressed_dim::Int64
     total_dim::Int64
@@ -165,7 +165,7 @@ hypothesis_masks::Matrix{Bool}: The original hypothesis masks. Indexed mask[hypo
 disjoint_masks::Array{Bool}: The generated disjoint masks, indexed [mask, category].
 mask_subset_indicators::Matrix{Bool}: mask_subset_indicators[mask, hypothesis] == true if the hypothesis is true for this mask.
 """
-function gen_disjoint_masks(hypothesis_masks::Matrix{Bool})
+function gen_disjoint_masks(hypothesis_masks::AbstractMatrix{Bool})
     disjoint_masks = Vector{Bool}[]
     mask_subset_indicators = Vector{Bool}[]
     # Go through subsets WARNING: grows super fast with number of hypotheses
@@ -188,7 +188,7 @@ See above docstring for field descriptions.
 """
 function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
     parameter_names::Vector{String},
-    hypothesis_masks::Union{Matrix{Bool},Nothing},
+    hypothesis_masks::Union{AbstractMatrix{Bool},Nothing},
     transition_function::Function,
     log_con_lik_matrix::Matrix{Float64},
     con_lik_matrix::Matrix{Float64},
@@ -300,7 +300,7 @@ function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64
     parameters = model.ambient_to_parameter_transform(ambient_sample)
     _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
     probability_vector = softmax(unsuppressed_parameters)
-    if model.suppression_dim > 0 # The unsuppressed case
+    if model.suppression_dim == 0 # The unsuppressed case
         return probability_vector
     end
 
