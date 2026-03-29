@@ -1,7 +1,4 @@
-using Statistics, Combinatorics, Distributions, MCMCChains, LinearAlgebra, Phylo, FASTX, MolecularEvolution, CodonMolecularEvolution, Plots, EllipticalSliceSampling, AbstractMCMC, NNlib, StatsBase, ProgressMeter, JLD2, AdvancedHMC, Zygote, ADTypes, DifferentiationInterface, LogDensityProblems, Mooncake, LogDensityProblemsAD
-#import Zygote
-#import LogDensityProblemsAD
-include("convolution.jl")
+
 
 """
 # GeneralizedFUBARModel
@@ -230,13 +227,37 @@ function SKBDIModel(parameter_grids::Vector{Vector{Float64}},
 end
 
 """
+ProbabilityVectorReshapingScheme
+This type is used to determine how (un)reshaping probability vector to(from) probability array works.
+(un)reshaping then works by calling (un_)reshape_probability_vector(layout::ProbabilityVectorReshapingScheme, probability_vector(array))
+"""
+abstract type ProbabilityVectorReshapingScheme end
+
+"""
+DifFUBARReshapingScheme
+Used specifically in the case when the codon_param_index_vec matches the difFUBAR indexation
+"""
+struct DifFUBARReshapingScheme{N} <: ProbabilityVectorReshapingScheme
+    grid_sizes::NTuple{N,Int}
+end
+
+"""
+GeneralCategoricalReshapingScheme
+Works for a general indexation, but makes reshaping slower than for DifFUBARReshapingScheme
+"""
+struct GeneralCategoricalReshapingScheme{N} <: ProbabilityVectorReshapingScheme
+    grid_sizes::NTuple{N,Int}
+    codon_param_index_vec::Vector{Vector{Int}}
+end
+
+"""
 # reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
 Takes a vector with index according to codon_param_index_vec 
 and returns the corresponding multidimensional array with shape according to grid sizes.
 """
-function reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
-    probability_array = zeros(Float64, grid_sizes)
-    for (i, grid_point) in enumerate(codon_param_index_vec)
+function reshape_probability_vector(layout::GeneralCategoricalReshapingScheme,  probability_vector::AbstractVector{<:Real})
+    probability_array = zeros(eltype(ambient_parameters), layout.grid_sizes)
+    for (i, grid_point) in enumerate(layout.codon_param_index_vec)
         probability_array[grid_point...] = probability_vector[i]
     end
     return probability_array
@@ -246,9 +267,9 @@ end
 # unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
 Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
 """
-function unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
-    probability_vector = zeros(Float64, length(codon_param_index_vec))
-    for (i, grid_point) in enumerate(codon_param_index_vec)
+function unreshape_probability_vector(layout::GeneralCategoricalReshapingScheme, probability_array::AbstractArray{<:Real})
+    probability_vector = zeros(eltype(probability_array), length(codon_param_index_vec))
+    for (i, grid_point) in enumerate(layout.codon_param_index_vec)
         probability_vector[i] = probability_array[grid_point...]
     end
     return probability_vector
@@ -259,9 +280,9 @@ end
 Takes a vector with index according to codon_param_index_vec and reshapes it into a multidimensional array based on the grid sizes.
 NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid(), but is fast and AD safe
 """
-function reshape_probability_vector(grid_sizes::Tuple, probability_vector::AbstractVector{<:Real})
-    return permutedims(reshape(probability_vector, reverse(grid_sizes)...),
-        reverse(1:length(grid_sizes)))
+function reshape_probability_vector(layout::DifFUBARReshapingScheme, probability_vector::AbstractVector{<:Real})
+    return permutedims(reshape(probability_vector, reverse(layout.grid_sizes)...),
+        reverse(1:length(layout.grid_sizes)))
 end
 
 """
@@ -269,8 +290,8 @@ end
 Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
 NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid, but is fast and AD safe
 """
-function unreshape_probability_vector(grid_sizes::Tuple, probability_array::AbstractArray{<:Real})
-    return vec(permutedims(probability_array, reverse(1:length(grid_sizes))))
+function unreshape_probability_vector(layout::DifFUBARReshapingScheme, probability_array::AbstractArray{<:Real})
+    return vec(permutedims(probability_array, reverse(1:length(layout.grid_sizes))))
 end
 
 """
@@ -332,55 +353,26 @@ function log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real
 end
 
 """
-# fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
-Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-NOTE: This is identical to the below grid_based_ambient_to_parameter_transform, but uses the fubar_apply_smoothing function.
-TODO: make this and the below function into only one function using multiple dispatch.
-The main difference is the reshaping operation.
-## Parameters:
-ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
-grid_sizes::Tuple: The sizes of the parameter grids.
-codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
-kernel_dim::Int64: The dimensionality of the kernel parameters.
-suppression_dim::Int64: The dimensionality of the suppression parameters.
-kernel_stddev::Float64: The standard deviation for the kernel parameters.
-suppression_stddev::Float64: The standard deviation for the suppression parameters.
-## Returns:
-AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
-(kernel_parameters, suppression_parameters, unsuppressed_parameters).
-"""
-function fubar_ambient_to_parameter_transform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
-    kernel_parameters = ambient_sample[1:kernel_dim]
-    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
-    ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
-    kernel_parameters = kernel_stddev * kernel_parameters
-    suppression_parameters = suppression_stddev * suppression_parameters
-    return vcat(kernel_parameters, suppression_parameters, fubar_apply_smoothing(grid_sizes, codon_param_index_vec, ambient_unsuppressed_parameters, kernel_parameters))
-end
-
-
-"""
-GridBasedTransform
+AmbientToParameterTransform
 An object that describes a callable transform from ambient space to parameter space
 Specifically, it is called to transform an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
 ## Fields:
-
-grid_sizes::Tuple: The sizes of the parameter grids.
+layout<:ProbabilityVectorReshapingScheme  Determines how the probability vector is reshaped in the apply_smoothing function.
 codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
 kernel_dim::Int64: The dimensionality of the kernel parameters.
 suppression_dim::Int64: The dimensionality of the suppression parameters.
-kernel_stddev::Float64: The standard deviation for the kernel parameters.
-suppression_stddev::Float64: The standard deviation for the suppression parameters."""
-struct GridBasedTransform
-    #grid_sizes::Tuple
+kernel_stddev<:Real: The standard deviation for the kernel parameters.
+suppression_stddev<:Real: The standard deviation for the suppression parameters."""
+struct AmbientToParameterTransform{L<:ProbabilityVectorReshapingScheme, T<:Real}
+    layout::L
     kernel_dim::Int
     suppression_dim::Int
-    kernel_stddev::Float64
-    suppression_stddev::Float64
+    kernel_stddev::T
+    suppression_stddev::T
 end
 
 """
-# GridBasedTransform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
+# AmbientToParameterTransform(ambient_sample::AbstractVector{<:Real}, grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, kernel_dim::Int64, suppression_dim::Int64, kernel_stddev::Float64, suppression_stddev::Float64)
 Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
 ## Parameters
 ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
@@ -388,29 +380,14 @@ ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
 AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
 (kernel_parameters, suppression_parameters, unsuppressed_parameters).
 """
-function (t::GridBasedTransform)(ambient_sample::AbstractVector{<:Real})
-    
-    k = t.kernel_dim
-    s = t.suppression_dim
-
-    kernel_parameters = @view ambient_sample[1:k]
-    suppression_parameters = @view ambient_sample[k+1:k+s]
-    ambient_unsuppressed_parameters = @view ambient_sample[k+s+1:end]
-
-    return vcat(
-        t.kernel_stddev .* kernel_parameters,
-        t.suppression_stddev .* suppression_parameters,
-        ambient_unsuppressed_parameters,
-    )
-
-    #= kernel_parameters = ambient_sample[1:kernel_dim]
-    suppression_parameters = ambient_sample[kernel_dim+1:kernel_dim+suppression_dim]
-    ambient_unsuppressed_parameters = ambient_sample[kernel_dim+suppression_dim+1:end]
-    kernel_parameters = kernel_stddev * kernel_parameters
-    suppression_parameters = suppression_stddev * suppression_parameters
-    return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # For debugging only!
-    return vcat(kernel_parameters, suppression_parameters, apply_smoothing(grid_sizes, ambient_unsuppressed_parameters, kernel_parameters))
-    #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) =#
+function (t::AmbientToParameterTransform)(ambient_sample::AbstractVector{<:Real})
+    kernel_parameters = ambient_sample[1:t.kernel_dim]
+    suppression_parameters = ambient_sample[t.kernel_dim+1:t.kernel_dim+t.suppression_dim]
+    ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
+    kernel_parameters = t.kernel_stddev * kernel_parameters
+    suppression_parameters = t.suppression_stddev * suppression_parameters
+    return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # TODO: this is short circuited for debugging.
+    #return vcat(kernel_parameters, suppression_parameters, apply_smoothing(layout, ambient_unsuppressed_parameters, kernel_parameters))
 end
 
 """
@@ -545,8 +522,8 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
             con_lik_matrix,
             codon_param_vec,
             codon_param_index_vec,
-            GridBasedTransform(
-                grid_sizes,
+            AmbientToParameterTransform(
+                DifFUBARReshapingScheme(grid_sizes),
                 1,
                 size(hypothesis_masks, 1),
                 kernel_stddev,
@@ -689,7 +666,13 @@ function FUBAR_analysis_grid_based(method::GRIDFUBAR, grid::FUBARGrid{T};
         grid.cond_lik_matrix,
         codon_param_vec,
         codon_param_index_vec,
-        s -> fubar_ambient_to_parameter_transform(s, grid_sizes, codon_param_index_vec, 1, 1, kernel_stddev, suppression_stddev),
+        AmbientToParameterTransform(
+            GeneralCategoricalReshapingScheme(grid_sizes, codon_param_index_vec),
+            1,
+            1,
+            kernel_stddev,
+            suppression_stddev
+        ),
         1,
         grid_sizes
     )

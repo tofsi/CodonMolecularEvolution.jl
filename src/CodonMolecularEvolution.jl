@@ -6,6 +6,11 @@ using PDMats, BenchmarkTools
 using EllipticalSliceSampling
 using KrylovKit
 using Plots
+
+#From skbdiffubar.jl:
+using AbstractMCMC, ProgressMeter, JLD2, AdvancedHMC, ADTypes, LogDensityProblems, DifferentiationInterface, Mooncake, LogDensityProblemsAD
+
+
 abstract type difFUBARGrid end
 abstract type BAMEgrid end #Bayesian Approaches to Mixed Effects
 struct PlotsExtDummy end
@@ -15,11 +20,19 @@ include("shared/emptyplot.jl")
 include("shared/dNdS2JSON.jl")
 include("difFUBAR/difFUBAR.jl")
 include("difFUBAR/grids.jl")
-include("../test/benchmark_difFUBAR.jl")
+
 
 include("FUBAR/FUBAR.jl")
-# include("smoothFUBAR/smoothFUBAR.jl")
 include("FLAVOR/FLAVOR.jl")
+# include("smoothFUBAR/smoothFUBAR.jl")
+include("difFUBAR/skbDifFUBAR.jl")
+include("FUBAR/gaussianFUBAR.jl")
+include("difFUBAR/convolution.jl")
+include("FLAVOR/smoothFLAVOR.jl")
+include("../test/benchmark_difFUBAR.jl")
+
+
+
 
 include("MEME/MEME.jl")
 
@@ -28,7 +41,6 @@ include("FAME/FAME.jl")
 include("simulations/simulations.jl")
 include("simulations/alphabeta/alphabeta.jl")
 include("simulations/ou_hb.jl")
-include("FUBAR/gaussianFUBAR.jl")
 include("FUBAR/grid_utilities.jl")
 
 export

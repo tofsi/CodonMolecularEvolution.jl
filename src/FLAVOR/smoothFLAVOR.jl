@@ -1,16 +1,3 @@
-using Distributions
-using StatsBase
-using DataFrames
-using CSV
-
-if !isdefined(@__MODULE__, :SKBDIModel)
-    include("../difFUBAR/skbDifFUBAR.jl")
-end
-
-if !isdefined(@__MODULE__, :FLAVORgrid)
-    include("FLAVOR.jl")
-end
-
 
 
 """
@@ -117,13 +104,13 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
     size(meta.hypothesis_masks, 2) == n_categories || throw(DimensionMismatch("Hypothesis mask does not match con_lik_matrix."))
 
-    ambient_to_parameter_transform = GridBasedTransform(
-    #meta.grid_sizes,
+    ambient_to_parameter_transform = AmbientToParameterTransform(
+    GeneralCategoricalReshapingScheme(meta.grid_sizes, meta.codon_param_index_vec),
     1,
     suppress ? 1 : 0,
     kernel_stddev,
     suppress ? suppression_stddev : 0.0,
-    )
+    ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
 
     # ambient_to_parameter_transform = identity
     #= ambient_to_parameter_transform = FlavorIdentityTransform(

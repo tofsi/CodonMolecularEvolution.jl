@@ -1,5 +1,4 @@
 
-include("../difFUBAR/convolution.jl")
 
 struct AmbientESSProblem
     loglikelihood::Function
