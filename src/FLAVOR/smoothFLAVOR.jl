@@ -90,7 +90,7 @@ categories, as returned by `CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)
 """
 function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     normalized::Bool=true,
-    kernel_dim::Int=0,
+    kernel_dim::Int=1,
     kernel_stddev::Real=4.0,
     suppress::Bool=false,
     suppression_stddev::Real=2.0,
