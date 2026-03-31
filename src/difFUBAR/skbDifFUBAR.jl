@@ -77,7 +77,7 @@ function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64
         Threads.@sync for i in 1:n_chains
             Threads.@spawn begin
                 local_initial = rand(model.prior)
-                local_samples, _ = sample(hamiltonian, kernel, local_initial, iters, adaptor, n_adapts; verbose=false)
+                local_samples, _ = sample(hamiltonian, kernel, local_initial, iters, adaptor, n_adapts; verbose=false, progress=progress)
                 ambient_samples[i] = local_samples
             end
         end
@@ -89,82 +89,6 @@ function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64
     return ambient_samples, stats
 end
 
-"""
-ProbabilityVectorReshapingScheme
-This type is used to determine how (un)reshaping probability vector to(from) probability array works.
-(un)reshaping then works by calling (un_)reshape_probability_vector(reshaping_scheme::ProbabilityVectorReshapingScheme, probability_vector(array))
-"""
-abstract type ProbabilityVectorReshapingScheme end
-
-"""
-DifFUBARReshapingScheme
-Used specifically in the case when the codon_param_index_vec matches the difFUBAR indexation
-"""
-struct DifFUBARReshapingScheme{N} <: ProbabilityVectorReshapingScheme
-    grid_sizes::NTuple{N,Int}
-end
-
-"""
-GeneralCategoricalReshapingScheme
-Works for a general indexation, but makes reshaping slower than for DifFUBARReshapingScheme
-"""
-struct GeneralCategoricalReshapingScheme{N, M} <: ProbabilityVectorReshapingScheme
-    grid_sizes::NTuple{N,Int}
-    codon_param_index_vec::NTuple{M, CartesianIndex{N}}
-end
-
-# Constructor, We convert the codon_param_index_vec to an immutable tuple representation because otherwise it is not handled well by AD
-function GeneralCategoricalReshapingScheme( 
-    grid_sizes::NTuple{N,Int},
-    codon_param_index_vec::AbstractVector{<:AbstractVector{<:Integer}},
-) where {N}
-    inds = Tuple(CartesianIndex(Tuple(idx)) for idx in codon_param_index_vec)
-    return GeneralCategoricalReshapingScheme{N,length(inds)}(grid_sizes, inds)
-end
-
-"""
-# reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
-Takes a vector with index according to codon_param_index_vec 
-and returns the corresponding multidimensional array with shape according to grid sizes.
-"""
-function reshape_probability_vector(reshaping_scheme::GeneralCategoricalReshapingScheme{N, M},  probability_vector::AbstractVector{T}) where {N, M, T<:Real}
-    probability_array = Array{T}(undef, reshaping_scheme.grid_sizes)
-    @inbounds for i = 1:M
-        probability_array[reshaping_scheme.codon_param_index_vec[i]] = probability_vector[i]
-    end
-    return probability_array
-end
-
-"""
-# unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
-Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
-"""
-function unreshape_probability_vector(reshaping_scheme::GeneralCategoricalReshapingScheme{N, M}, probability_array::AbstractArray{T}) where {N, M, T<:Real}
-    probability_vector = Vector{T}(undef, M)
-    @inbounds for i = 1:M
-        probability_vector[i] = probability_array[reshaping_scheme.codon_param_index_vec[i]]
-    end
-    return probability_vector
-end
-
-"""
-# reshape_probability_vector(grid_sizes::Tuple, probability_vector::AbstractVector{<:Real})
-Takes a vector with index according to codon_param_index_vec and reshapes it into a multidimensional array based on the grid sizes.
-NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid(), but is fast and AD safe
-"""
-function reshape_probability_vector(reshaping_scheme::DifFUBARReshapingScheme, probability_vector::AbstractVector{<:Real})
-    return permutedims(reshape(probability_vector, reverse(reshaping_scheme.grid_sizes)...),
-        reverse(1:length(reshaping_scheme.grid_sizes)))
-end
-
-"""
-# unreshape_probability_vector()
-Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
-NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid, but is fast and AD safe
-"""
-function unreshape_probability_vector(reshaping_scheme::DifFUBARReshapingScheme, probability_array::AbstractArray{<:Real})
-    return vec(permutedims(probability_array, reverse(1:length(reshaping_scheme.grid_sizes))))
-end
 
 """
 AmbientToParameterTransform
@@ -177,7 +101,7 @@ kernel_dim::Int64: The dimensionality of the kernel parameters.
 suppression_dim::Int64: The dimensionality of the suppression parameters.
 kernel_stddev<:Real: The standard deviation for the kernel parameters.
 suppression_stddev<:Real: The standard deviation for the suppression parameters."""
-struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme, T<:Real}
+struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real}
     reshaping_scheme::S
     kernel_dim::Int
     suppression_dim::Int

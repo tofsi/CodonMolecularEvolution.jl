@@ -93,8 +93,9 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     kernel_dim::Int=1,
     kernel_stddev::Real=4.0,
     suppress::Bool=false,
+    fast_reshaping::Bool=true,
     suppression_stddev::Real=2.0,
-    transition_function=s -> CodonMolecularEvolution.quintic_smooth_transition(s, 0.0, 1.0))
+    transition_function=s -> quintic_smooth_transition(s, 0.0, 1.0))
 
     meta = flavor_parameter_metadata(flavorgrid)
     con_lik_matrix = flavor_con_lik_matrix(flavorgrid; normalized=normalized)
@@ -103,13 +104,13 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     n_categories = size(con_lik_matrix, 1)
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
     size(meta.hypothesis_masks, 2) == n_categories || throw(DimensionMismatch("Hypothesis mask does not match con_lik_matrix."))
-
+    reshaping_scheme = fast_reshaping ? FLAVORReshapingScheme(meta.grid_sizes) : GeneralCategoricalReshapingScheme(meta.grid_sizes, meta.codon_param_index_vec)
     ambient_to_parameter_transform = AmbientToParameterTransform(
-    GeneralCategoricalReshapingScheme(meta.grid_sizes, meta.codon_param_index_vec),
-    1,
-    suppress ? 1 : 0,
-    kernel_stddev,
-    suppress ? suppression_stddev : 0.0,
+        reshaping_scheme,
+        1,
+        suppress ? 1 : 0,
+        kernel_stddev,
+        suppress ? suppression_stddev : 0.0,
     ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
 
     # ambient_to_parameter_transform = identity

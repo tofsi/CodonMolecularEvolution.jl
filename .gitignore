@@ -8,3 +8,4 @@ test/timing*
 **/fubar/
 **/output/
 /test/data
+**/temp/
