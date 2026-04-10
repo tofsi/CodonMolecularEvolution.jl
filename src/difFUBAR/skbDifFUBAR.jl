@@ -289,7 +289,7 @@ Computes the probability vector for the model given the parameters (ambient_samp
 Parameters are assumed to be in the order: kernel, suppression, unsuppressed with lengths matching
 model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
 """
-function to_probability_vector(model::SKBDIModel, ambient_sample::Vector{Float64})
+function to_probability_vector(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
 
     parameters = transform_ambient_sample(model.ambient_to_parameter_transform, ambient_sample)
     _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
