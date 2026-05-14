@@ -12,7 +12,7 @@ result = run_one_omnibus_multi_kernel_stddev_study(
     joinpath(@__DIR__, "..", "data", "omnibus-multi"),
     joinpath(@__DIR__, "..", "output", "one-omnibus-multi");
     simulation_index = 1,
-    kernel_stddevs = [0.5, 1.0, 2.0],
+    kernel_stddevs = [0.0, 0.5, 1.0, 2.0],
     iters = 300,
     burnin = 75,
     n_chains = n_chains,
