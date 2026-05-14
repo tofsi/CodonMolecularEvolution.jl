@@ -9,3 +9,4 @@ test/timing*
 **/output/
 /test/data
 **/temp/
+parameter_study/data

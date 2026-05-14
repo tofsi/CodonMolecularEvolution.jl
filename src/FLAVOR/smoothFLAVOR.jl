@@ -241,12 +241,14 @@ function smoothFLAVOR_BAME(
     pos_thresh=0.9,
     iters=10,
     burnin=div(iters, 4),
+    kernel_stddev=4.0,
     n_chains=4,
     verbosity=1,
     exports=true,
     sample_allocations=false,
+    fast_reshaping=true
 )
-    sk_model = SKBDIModel_from_FLAVOR(flavorgrid)
+    sk_model = SKBDIModel_from_FLAVOR(flavorgrid, kernel_stddev = kernel_stddev, fast_reshaping=fast_reshaping)
     fubar_model = GeneralizedFUBARModel(sk_model)
 
     if verbosity > 0
