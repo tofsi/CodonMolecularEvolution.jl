@@ -107,8 +107,25 @@ struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real}
     suppression_dim::Int
     kernel_stddev::T
     suppression_stddev::T
+    smoothing::Bool
 end
 
+function AmbientToParameterTransform(
+    reshaping_scheme::S,
+    kernel_dim::Int,
+    suppression_dim::Int,
+    kernel_stddev::T,
+    suppression_stddev::T,
+) where {S<:ProbabilityVectorReshapingScheme,T<:Real}
+    return AmbientToParameterTransform(
+        reshaping_scheme,
+        kernel_dim,
+        suppression_dim,
+        kernel_stddev,
+        suppression_stddev,
+        true,
+    )
+end
 """
 # transform_ambient_sample(transform::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
 Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
@@ -124,6 +141,14 @@ function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample
     ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
     kernel_parameters = t.kernel_stddev * kernel_parameters
     suppression_parameters = t.suppression_stddev * suppression_parameters
+    if !t.smoothing
+        return vcat(
+            kernel_parameters,
+            suppression_parameters,
+            ambient_unsuppressed_parameters,
+        )
+    end
+
     #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # TODO: this is short circuited for debugging.
     return vcat(kernel_parameters, suppression_parameters, apply_smoothing(t.reshaping_scheme, ambient_unsuppressed_parameters, kernel_parameters))
 end
