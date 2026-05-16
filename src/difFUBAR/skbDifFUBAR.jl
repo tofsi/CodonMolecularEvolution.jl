@@ -124,9 +124,6 @@ function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample
     ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
     kernel_parameters = t.kernel_stddev * kernel_parameters
     suppression_parameters = t.suppression_stddev * suppression_parameters
-    if kernel_dim == 0 # The unsmoothed case
-        return v_cat(suppression_parameters, ambient_unsuppressed_parameters)
-    end
     #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # TODO: this is short circuited for debugging.
     return vcat(kernel_parameters, suppression_parameters, apply_smoothing(t.reshaping_scheme, ambient_unsuppressed_parameters, kernel_parameters))
 end
