@@ -93,7 +93,6 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     kernel_dim::Int=1,
     kernel_stddev::Real=4.0,
     suppress::Bool=false,
-    smoothing::Bool=false,
     fast_reshaping::Bool=true,
     suppression_stddev::Real=2.0,
     transition_function=s -> quintic_smooth_transition(s, 0.0, 1.0))
@@ -101,7 +100,6 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     meta = flavor_parameter_metadata(flavorgrid)
     con_lik_matrix = flavor_con_lik_matrix(flavorgrid; normalized=normalized)
     log_con_lik_matrix = log.(con_lik_matrix)
-    effective_kernel_dim = smoothing ? kernel_stddev : 1.0
 
     n_categories = size(con_lik_matrix, 1)
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
@@ -109,11 +107,10 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     reshaping_scheme = fast_reshaping ? FLAVORReshapingScheme(meta.grid_sizes) : GeneralCategoricalReshapingScheme(meta.grid_sizes, meta.codon_param_index_vec)
     ambient_to_parameter_transform = AmbientToParameterTransform(
         reshaping_scheme,
-        kernel_dim,
+        1,
         suppress ? 1 : 0,
-        effective_kernel_stddev,
+        kernel_stddev,
         suppress ? suppression_stddev : 0.0,
-        smoothing
     ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
 
     # ambient_to_parameter_transform = identity
@@ -249,10 +246,9 @@ function smoothFLAVOR_BAME(
     verbosity=1,
     exports=true,
     sample_allocations=false,
-    fast_reshaping=true,
-    smoothing=true
+    fast_reshaping=true
 )
-    sk_model = SKBDIModel_from_FLAVOR(flavorgrid, kernel_stddev = kernel_stddev, fast_reshaping=fast_reshaping, smoothing=smoothing)
+    sk_model = SKBDIModel_from_FLAVOR(flavorgrid, kernel_stddev = kernel_stddev, fast_reshaping=fast_reshaping)
     fubar_model = GeneralizedFUBARModel(sk_model)
 
     if verbosity > 0

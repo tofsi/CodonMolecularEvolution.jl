@@ -10,7 +10,7 @@ n_chains = max(1, Threads.nthreads() - 1)
 result = run_omnibus_multi_kernel_stddev_sweep(
     "/path/to/omnibus_multi",
     "/path/to/output/full_run";
-    kernel_stddevs = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
+    kernel_stddevs = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
     iters = 1000,
     burnin = 250,
     n_chains = n_chains,
