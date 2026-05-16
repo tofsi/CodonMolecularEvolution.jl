@@ -241,6 +241,7 @@ function smoothFLAVOR_BAME(
     pos_thresh=0.9,
     iters=10,
     burnin=div(iters, 4),
+    n_adapts=50,
     kernel_stddev=4.0,
     n_chains=4,
     verbosity=1,
@@ -255,7 +256,7 @@ function smoothFLAVOR_BAME(
         println("Sampling from smoothFLAVOR with NUTS.")
     end
 
-    ambient_samples, stats = sample_NUTS(fubar_model, iters, n_chains; progress=verbosity > 0)
+    ambient_samples, stats = sample_NUTS(fubar_model, iters, n_chains; n_adapts=n_adapts, progress=verbosity > 0)
 
     summary = summarize_smoothFLAVOR_BAME(
         flavorgrid,

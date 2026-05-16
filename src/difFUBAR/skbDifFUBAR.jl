@@ -53,18 +53,19 @@ Samples from the model using NUTS
 - model::GeneralizedFUBARModel: The model to sample from.
 - iters::Int64: The number of iterations to sample.
 - n_chains::Int64: The number of chains to use for sampling.
+- n_adapts::Int Number of adaptation steps
 - progress::Bool: Whether to show progress bars.
 ## Returns:
 - ambient_samples::Vector{Any}: The sampled parameter values. Indexed as 
 - stats::Any: The sampling statistics.
 """
-function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64; progress=false)
+function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64; n_adapts::Int64=div(iters, 10), progress=false)
 
     initial_parameters = rand(model.prior)
     target = FUBARLogDensity(model)
     metric = DiagEuclideanMetric(model.n_parameters)
     hamiltonian = Hamiltonian(metric, target, AutoMooncake(; config=nothing)) # We use mooncake because it is good for the case R^n → R
-    n_adapts = div(iters, 10) # Number of adaptation steps, Default is min(1000, div(iters, 10))
+    n_adapts = min(n_adapts, iters - 1) 
     print("finding good epsilon...\n")
     epsilon = find_good_stepsize(hamiltonian, initial_parameters)
     integrator = Leapfrog(epsilon)

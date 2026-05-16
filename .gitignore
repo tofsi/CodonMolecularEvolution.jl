@@ -4,9 +4,12 @@
 /Manifest.toml
 /docs/build/
 test/timing*
+parameter_study/data
+/test/data
+*/.venv
 # The following are names of output folders which fill with junk when running code
 **/fubar/
 **/output/
-/test/data
+*/results
 **/temp/
-parameter_study/data
+
