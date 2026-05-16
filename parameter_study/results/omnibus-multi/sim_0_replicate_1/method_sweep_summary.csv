@@ -1,0 +1,2 @@
+method,kernel_stddev,auc,auprc,n_sites,n_true_positive_sites,n_called_at_pos_thresh,pos_thresh,tpr_at_pos_thresh,fpr_at_pos_thresh,precision_at_pos_thresh,elapsed_seconds
+original_BAME,NaN,0.8648880011413894,0.6270207464708427,206,43,5,0.9,0.09302325581395349,0.006134969325153374,0.8,8.88962485

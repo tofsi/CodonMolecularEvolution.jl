@@ -103,20 +103,16 @@ function load_omnibus_multi_truth_npz(
 
     sim_ix = only(matches)
 
-    # The Python extractor uses zero-padded position keys when the rates are
-    # non-rectangular:
-    #
-    #   rates_0000, rates_0001, ...
-    #
-    # where the index is the position in the sorted sim_ids array, not necessarily
-    # the simulation id itself.
-    rate_key = "rates_" * lpad(string(sim_ix - 1), 4, "0")
+    M = try
+        rates = Array(_read_npz_key(true_rates_path, "rates"))
+        ndims(rates) == 3 || error("Expected rates tensor to have 3 dimensions, got size $(size(rates))")
+        Float64.(rates[sim_ix, :, :])
+    catch err
+        rate_key = "rates_" * lpad(string(sim_ix - 1), 4, "0")
+        Float64.(Array(_read_npz_key(true_rates_path, rate_key)))
+    end
 
-    M = Float64.(Array(_read_npz_key(true_rates_path, rate_key)))
-
-    ndims(M) == 2 || error(
-        "Expected $rate_key to be a sites × parameters matrix, got size $(size(M))"
-    )
+    ndims(M) == 2 || error("Expected truth rates matrix to be sites × parameters, got size $(size(M))")
 
     n_sites, n_params = size(M)
     n_params >= 2 || error("Expected alpha plus at least one non-alpha rate column, got $n_params columns.")
@@ -197,8 +193,6 @@ function load_omnibus_multi_truth_table(raw::DataFrame, source_name::AbstractStr
             α = Float64(raw[i, alpha_col])
             βs = Float64[Float64(raw[i, col]) for col in nonalpha_cols]
 
-            # For omnibus_multi_true_rates.npz, the extractor writes alpha plus
-            # branch-set-specific beta/rate columns. Positive selection is beta > alpha.
             truth_positive[i] = any(β -> β > α, βs)
 
             ωs = α == 0.0 ? fill(Inf, length(βs)) : βs ./ α
