@@ -102,12 +102,37 @@ kernel_dim::Int64: The dimensionality of the kernel parameters.
 suppression_dim::Int64: The dimensionality of the suppression parameters.
 kernel_stddev<:Real: The standard deviation for the kernel parameters.
 suppression_stddev<:Real: The standard deviation for the suppression parameters."""
-struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real}
+struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real,D<:Tuple}
     reshaping_scheme::S
     kernel_dim::Int
     suppression_dim::Int
     kernel_stddev::T
     suppression_stddev::T
+    smoothing_dims::D
+end
+
+
+function AmbientToParameterTransform(
+    reshaping_scheme::S,
+    kernel_dim::Int,
+    suppression_dim::Int,
+    kernel_stddev::T,
+    suppression_stddev::T,
+) where {
+    S<:ProbabilityVectorReshapingScheme,
+    T<:Real,
+}
+    smoothing_dims =
+        ntuple(identity, length(reshaping_scheme.grid_sizes))
+
+    return AmbientToParameterTransform(
+        reshaping_scheme,
+        kernel_dim,
+        suppression_dim,
+        kernel_stddev,
+        suppression_stddev,
+        smoothing_dims,
+    )
 end
 
 """
@@ -126,7 +151,7 @@ function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample
     kernel_parameters = t.kernel_stddev * kernel_parameters
     suppression_parameters = t.suppression_stddev * suppression_parameters
     #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # TODO: this is short circuited for debugging.
-    return vcat(kernel_parameters, suppression_parameters, apply_smoothing(t.reshaping_scheme, ambient_unsuppressed_parameters, kernel_parameters))
+    return vcat(kernel_parameters, suppression_parameters, apply_smoothing(t.reshaping_scheme, ambient_unsuppressed_parameters, kernel_parameters, dims=t.smoothing_dims))
 end
 
 """

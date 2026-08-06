@@ -4,15 +4,15 @@ This file contains code for applying Gaussian smoothing to multi-dimensional arr
 
 
 """
-# apply_smoothing(reshaping_scheme::ProbabilityVectorReshapingScheme, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real})
+# apply_smoothing(reshaping_scheme::ProbabilityVectorReshapingScheme, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real}, dims=ntuple(identity, length(reshaping_scheme.grid_sizes)))
 Applies a Gaussian smoothing filter to the ambient parameters (with dimension equaling that of the probability vector).
 The gaussian kernel used has variance specified by kernel_parameters[1]^2.
 """
-function apply_smoothing(reshaping_scheme::ProbabilityVectorReshapingScheme, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real})
+function apply_smoothing(reshaping_scheme::ProbabilityVectorReshapingScheme, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real}; dims=ntuple(identity, length(reshaping_scheme.grid_sizes)))
     ambient_parameter_array = reshape_probability_vector(reshaping_scheme, ambient_parameters)
     #return unreshape_probability_vector(reshaping_scheme, ambient_parameter_array) # TODO: Remove this shortcircuit when ad works.
     kernel = gaussian_kernel(5, kernel_parameters[1]^2) #approximate_gaussian_kernel(kernel_parameters[1]^2, 4)
-    smoothed_parameter_array = apply_separable_convolution(ambient_parameter_array, kernel)
+    smoothed_parameter_array = apply_separable_convolution(ambient_parameter_array, kernel, dims=dims)
     return unreshape_probability_vector(reshaping_scheme, smoothed_parameter_array)
 end
 
@@ -33,9 +33,9 @@ end
 # apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real})
 Applies a separable convolution defined by kernel to a multi-dimensional array x.
 """
-function apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real})
+function apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real}; dims=ntuple(identity, ndims(x)))
     y = copy(x) # Zygote does not like mutation
-    for d in 1:ndims(x)
+    for d in dims
         y = convolve_along_dim(y, kernel, d)
     end
     return y

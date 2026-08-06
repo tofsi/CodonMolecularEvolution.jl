@@ -111,6 +111,7 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
         suppress ? 1 : 0,
         kernel_stddev,
         suppress ? suppression_stddev : 0.0,
+        (1, 3),  # μ, α; do not smooth shape, "capped"
     ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
 
     # ambient_to_parameter_transform = identity
