@@ -236,20 +236,286 @@ function summarize_smoothFLAVOR_BAME(
     )
 end
 
+function _ambient_chain_array(ambient_samples::Vector)
+    n_chains = length(ambient_samples)
+    n_chains > 0 || error("No NUTS chains were returned")
+    n_iterations = length(first(ambient_samples))
+    n_iterations > 0 || error("NUTS returned an empty chain")
+    n_parameters = length(first(first(ambient_samples)))
+
+    samples = Array{Float64}(undef, n_iterations, n_parameters, n_chains)
+    for chain_index in eachindex(ambient_samples)
+        chain = ambient_samples[chain_index]
+        length(chain) == n_iterations ||
+            throw(DimensionMismatch("NUTS chains have unequal iteration counts"))
+        for iteration in eachindex(chain)
+            length(chain[iteration]) == n_parameters ||
+                throw(DimensionMismatch("NUTS samples have unequal parameter counts"))
+            samples[iteration, :, chain_index] .= Float64.(chain[iteration])
+        end
+    end
+    return samples
+end
+
+function _ambient_parameter_names(sk_model::SKBDIModel)
+    names = String[]
+    append!(names, ["kernel_$(i)" for i in 1:sk_model.kernel_dim])
+    append!(names, ["suppression_$(i)" for i in 1:sk_model.suppression_dim])
+    append!(names, ["ambient_weight_$(i)" for i in 1:sk_model.unsuppressed_dim])
+    length(names) == sk_model.total_dim ||
+        throw(DimensionMismatch("Parameter names do not match the NUTS model dimension"))
+    return names
+end
+
+function save_smoothFLAVOR_chain_artifacts!(
+    outpath::AbstractString,
+    ambient_samples::Vector,
+    parameter_names::AbstractVector{<:AbstractString};
+    burnin::Int,
+    n_adapts::Int,
+    save_chain_samples::Bool=true,
+)
+    samples = _ambient_chain_array(ambient_samples)
+    n_iterations, n_parameters, n_chains = size(samples)
+    0 <= n_adapts <= burnin < n_iterations || throw(ArgumentError(
+        "Require 0 <= n_adapts <= burnin < chain length; got " *
+        "n_adapts=$n_adapts, burnin=$burnin, chain length=$n_iterations",
+    ))
+
+    length(parameter_names) == n_parameters ||
+        throw(DimensionMismatch("Saved sample dimension does not match parameter metadata"))
+    retained_samples = samples[burnin+1:end, :, :]
+    chains = MCMCChains.Chains(retained_samples, Symbol.(parameter_names))
+    diagnostics = DataFrame(MCMCChains.summarystats(chains))
+    diagnostics[!, :parameter_group] = [
+        startswith(String(name), "kernel_") ? "kernel" :
+        startswith(String(name), "suppression_") ? "suppression" : "ambient_weight"
+        for name in diagnostics.parameters
+    ]
+    diagnostics[!, :n_chains] .= n_chains
+    diagnostics[!, :iterations_per_chain] .= n_iterations
+    diagnostics[!, :burnin] .= burnin
+    diagnostics[!, :n_adapts] .= n_adapts
+    diagnostics[!, :retained_per_chain] .= n_iterations - burnin
+
+    finite_values(values) = filter(isfinite, Float64[value for value in skipmissing(values)])
+    finite_rhat = finite_values(diagnostics.rhat)
+    finite_bulk = finite_values(diagnostics.ess_bulk)
+    finite_tail = finite_values(diagnostics.ess_tail)
+    summary = DataFrame([(
+        n_parameters=n_parameters,
+        n_chains=n_chains,
+        iterations_per_chain=n_iterations,
+        burnin=burnin,
+        n_adapts=n_adapts,
+        retained_per_chain=n_iterations - burnin,
+        max_rhat=isempty(finite_rhat) ? NaN : maximum(finite_rhat),
+        n_rhat_above_1p01=count(>(1.01), finite_rhat),
+        min_ess_bulk=isempty(finite_bulk) ? NaN : minimum(finite_bulk),
+        min_ess_tail=isempty(finite_tail) ? NaN : minimum(finite_tail),
+    )])
+
+    CSV.write(outpath * "_chain_diagnostics.csv", diagnostics)
+    CSV.write(outpath * "_chain_diagnostics_summary.csv", summary)
+
+    samples_path = nothing
+    if save_chain_samples
+        samples_path = outpath * "_chain_samples.jld2"
+        JLD2.jldsave(
+            samples_path,
+            true;
+            samples=samples,
+            parameter_names=parameter_names,
+            burnin=burnin,
+            n_adapts=n_adapts,
+        )
+    end
+
+    return (
+        diagnostics=diagnostics,
+        diagnostics_summary=summary,
+        samples_path=samples_path,
+    )
+end
+
+function _nuts_statistic(stat, name::Symbol)
+    hasproperty(stat, name) ||
+        throw(ArgumentError("NUTS statistic is missing required field :$name"))
+    return getproperty(stat, name)
+end
+
+function save_NUTS_sampler_artifacts!(
+    outpath::AbstractString,
+    chain_stats::Vector;
+    burnin::Int,
+    n_adapts::Int,
+    max_tree_depth::Int=10,
+)
+    n_chains = length(chain_stats)
+    n_chains > 0 || throw(ArgumentError("No NUTS sampler statistics were returned"))
+    n_iterations = length(first(chain_stats))
+    0 <= n_adapts <= burnin < n_iterations || throw(ArgumentError(
+        "Require 0 <= n_adapts <= burnin < sampler-stat length; got " *
+        "n_adapts=$n_adapts, burnin=$burnin, sampler-stat length=$n_iterations",
+    ))
+    max_tree_depth > 0 || throw(ArgumentError("max_tree_depth must be positive"))
+
+    trace_rows = NamedTuple[]
+    for chain_index in eachindex(chain_stats)
+        stats = chain_stats[chain_index]
+        length(stats) == n_iterations ||
+            throw(DimensionMismatch("NUTS chains have unequal sampler-stat counts"))
+
+        for iteration in eachindex(stats)
+            stat = stats[iteration]
+            is_adapt = Bool(_nuts_statistic(stat, :is_adapt))
+            phase = is_adapt ? "adaptation" :
+                iteration <= burnin ? "post_adaptation_burnin" : "retained"
+            push!(trace_rows, (
+                chain=chain_index,
+                iteration=iteration,
+                phase=phase,
+                is_adapt=is_adapt,
+                log_density=Float64(_nuts_statistic(stat, :log_density)),
+                hamiltonian_energy=Float64(_nuts_statistic(stat, :hamiltonian_energy)),
+                hamiltonian_energy_error=Float64(_nuts_statistic(stat, :hamiltonian_energy_error)),
+                max_hamiltonian_energy_error=Float64(_nuts_statistic(stat, :max_hamiltonian_energy_error)),
+                acceptance_rate=Float64(_nuts_statistic(stat, :acceptance_rate)),
+                n_steps=Int(_nuts_statistic(stat, :n_steps)),
+                tree_depth=Int(_nuts_statistic(stat, :tree_depth)),
+                numerical_error=Bool(_nuts_statistic(stat, :numerical_error)),
+                step_size=Float64(_nuts_statistic(stat, :step_size)),
+                nominal_step_size=Float64(_nuts_statistic(stat, :nom_step_size)),
+            ))
+        end
+    end
+
+    trace = DataFrame(trace_rows)
+    chain_rows = NamedTuple[]
+    for chain_index in 1:n_chains
+        chain_trace = trace[trace.chain .== chain_index, :]
+        adaptation = chain_trace[chain_trace.phase .== "adaptation", :]
+        extra_burnin = chain_trace[chain_trace.phase .== "post_adaptation_burnin", :]
+        retained = chain_trace[chain_trace.phase .== "retained", :]
+        retained_energy = retained.hamiltonian_energy
+        ebfmi = length(retained_energy) > 1 ? AdvancedHMC.EBFMI(retained_energy) : NaN
+        tree_depth_hits = count(>=(max_tree_depth), retained.tree_depth)
+
+        push!(chain_rows, (
+            chain=chain_index,
+            iterations=nrow(chain_trace),
+            adaptation_iterations=nrow(adaptation),
+            post_adaptation_burnin_iterations=nrow(extra_burnin),
+            retained_iterations=nrow(retained),
+            adaptation_numerical_errors=count(adaptation.numerical_error),
+            post_adaptation_burnin_numerical_errors=count(extra_burnin.numerical_error),
+            retained_numerical_errors=count(retained.numerical_error),
+            retained_max_tree_depth_hits=tree_depth_hits,
+            retained_max_tree_depth_hit_rate=tree_depth_hits / nrow(retained),
+            retained_max_tree_depth=maximum(retained.tree_depth),
+            retained_mean_acceptance_rate=mean(retained.acceptance_rate),
+            retained_min_acceptance_rate=minimum(retained.acceptance_rate),
+            retained_mean_n_steps=mean(retained.n_steps),
+            retained_max_n_steps=maximum(retained.n_steps),
+            retained_mean_step_size=mean(retained.step_size),
+            final_step_size=last(chain_trace.step_size),
+            retained_ebfmi=ebfmi,
+            retained_log_density_mean=mean(retained.log_density),
+            retained_log_density_std=std(retained.log_density),
+            retained_log_density_min=minimum(retained.log_density),
+            retained_log_density_max=maximum(retained.log_density),
+            retained_nonfinite_log_density=count(value -> !isfinite(value), retained.log_density),
+            retained_max_abs_hamiltonian_energy_error=maximum(abs.(retained.hamiltonian_energy_error)),
+        ))
+    end
+    diagnostics = DataFrame(chain_rows)
+
+    retained_count = n_iterations - burnin
+    log_density_array = Array{Float64}(undef, retained_count, 1, n_chains)
+    for chain_index in 1:n_chains
+        retained = trace[(trace.chain .== chain_index) .& (trace.phase .== "retained"), :]
+        log_density_array[:, 1, chain_index] .= retained.log_density
+    end
+
+    log_density_rhat = NaN
+    log_density_ess_bulk = NaN
+    log_density_ess_tail = NaN
+    if retained_count >= 4 && n_chains >= 2 && all(isfinite, log_density_array)
+        log_density_chains = MCMCChains.Chains(log_density_array, [:log_density])
+        log_density_diagnostics = DataFrame(MCMCChains.summarystats(log_density_chains))
+        log_density_rhat = Float64(only(log_density_diagnostics.rhat))
+        log_density_ess_bulk = Float64(only(log_density_diagnostics.ess_bulk))
+        log_density_ess_tail = Float64(only(log_density_diagnostics.ess_tail))
+    end
+
+    finite_ebfmi = filter(isfinite, diagnostics.retained_ebfmi)
+    summary = DataFrame([(
+        n_chains=n_chains,
+        iterations_per_chain=n_iterations,
+        burnin=burnin,
+        n_adapts=n_adapts,
+        retained_per_chain=retained_count,
+        max_tree_depth=max_tree_depth,
+        total_adaptation_numerical_errors=sum(diagnostics.adaptation_numerical_errors),
+        total_post_adaptation_burnin_numerical_errors=sum(diagnostics.post_adaptation_burnin_numerical_errors),
+        total_retained_numerical_errors=sum(diagnostics.retained_numerical_errors),
+        total_retained_max_tree_depth_hits=sum(diagnostics.retained_max_tree_depth_hits),
+        max_retained_max_tree_depth_hit_rate=maximum(diagnostics.retained_max_tree_depth_hit_rate),
+        min_retained_ebfmi=isempty(finite_ebfmi) ? NaN : minimum(finite_ebfmi),
+        min_retained_mean_acceptance_rate=minimum(diagnostics.retained_mean_acceptance_rate),
+        max_retained_mean_acceptance_rate=maximum(diagnostics.retained_mean_acceptance_rate),
+        log_density_rhat=log_density_rhat,
+        log_density_ess_bulk=log_density_ess_bulk,
+        log_density_ess_tail=log_density_ess_tail,
+        log_density_chain_mean_range=maximum(diagnostics.retained_log_density_mean) -
+            minimum(diagnostics.retained_log_density_mean),
+        total_retained_nonfinite_log_density=sum(diagnostics.retained_nonfinite_log_density),
+    )])
+
+    CSV.write(outpath * "_sampler_trace.csv", trace)
+    CSV.write(outpath * "_sampler_diagnostics.csv", diagnostics)
+    CSV.write(outpath * "_sampler_diagnostics_summary.csv", summary)
+
+    return (trace=trace, diagnostics=diagnostics, diagnostics_summary=summary)
+end
+
+function save_smoothFLAVOR_chain_artifacts!(
+    outpath::AbstractString,
+    ambient_samples::Vector,
+    sk_model::SKBDIModel;
+    kwargs...,
+)
+    return save_smoothFLAVOR_chain_artifacts!(
+        outpath,
+        ambient_samples,
+        _ambient_parameter_names(sk_model);
+        kwargs...,
+    )
+end
+
 function smoothFLAVOR_BAME(
     flavorgrid,
     outpath;
     pos_thresh=0.9,
     iters=10,
     burnin=div(iters, 4),
-    n_adapts=50,
+    n_adapts=burnin,
     kernel_stddev=4.0,
     n_chains=4,
+    max_tree_depth=10,
     verbosity=1,
     exports=true,
     sample_allocations=false,
-    fast_reshaping=true
+    fast_reshaping=true,
+    save_chain_diagnostics=false,
+    save_chain_samples=false,
 )
+    0 <= n_adapts < iters ||
+        throw(ArgumentError("n_adapts must satisfy 0 <= n_adapts < iters; got n_adapts=$n_adapts, iters=$iters"))
+    n_adapts <= burnin < iters || throw(ArgumentError(
+        "burnin must satisfy n_adapts <= burnin < iters; got n_adapts=$n_adapts, burnin=$burnin, iters=$iters",
+    ))
+
     sk_model = SKBDIModel_from_FLAVOR(flavorgrid, kernel_stddev = kernel_stddev, fast_reshaping=fast_reshaping)
     fubar_model = GeneralizedFUBARModel(sk_model)
 
@@ -257,7 +523,35 @@ function smoothFLAVOR_BAME(
         println("Sampling from smoothFLAVOR with NUTS.")
     end
 
-    ambient_samples, stats = sample_NUTS(fubar_model, iters, n_chains; n_adapts=n_adapts, progress=verbosity > 0)
+    ambient_samples, stats = sample_NUTS(
+        fubar_model,
+        iters,
+        n_chains;
+        n_adapts=n_adapts,
+        max_tree_depth=max_tree_depth,
+        progress=verbosity > 0,
+    )
+
+    chain_artifacts = if save_chain_diagnostics || save_chain_samples
+        posterior_artifacts = save_smoothFLAVOR_chain_artifacts!(
+            outpath,
+            ambient_samples,
+            sk_model;
+            burnin=burnin,
+            n_adapts=n_adapts,
+            save_chain_samples=save_chain_samples,
+        )
+        sampler_artifacts = save_NUTS_sampler_artifacts!(
+            outpath,
+            stats;
+            burnin=burnin,
+            n_adapts=n_adapts,
+            max_tree_depth=max_tree_depth,
+        )
+        (posterior=posterior_artifacts, sampler=sampler_artifacts)
+    else
+        nothing
+    end
 
     summary = summarize_smoothFLAVOR_BAME(
         flavorgrid,
@@ -284,5 +578,6 @@ function smoothFLAVOR_BAME(
         pos_sel_mask=summary.pos_sel_mask,
         alloc_grid=summary.alloc_grid,
         stats=stats,
+        chain_artifacts=chain_artifacts,
     )
 end

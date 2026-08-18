@@ -103,6 +103,156 @@ function _resolve_manifest(rootdir::AbstractString; manifest=nothing)
     end
 end
 
+function _select_manifest_replicates(
+    manifest::DataFrame,
+    selected_simulations,
+    replicate_ids,
+)
+    replicate_ids === nothing && return manifest
+
+    manifest_names = Set(Symbol.(names(manifest)))
+    :replicate in manifest_names ||
+        throw(ArgumentError("Manifest must contain a :replicate column to select replicate IDs"))
+
+    selected_replicates = Int.(collect(replicate_ids))
+    isempty(selected_replicates) && throw(ArgumentError("replicate_ids must not be empty"))
+    all(>(0), selected_replicates) ||
+        throw(ArgumentError("replicate IDs must be positive; got $selected_replicates"))
+    length(unique(selected_replicates)) == length(selected_replicates) ||
+        throw(ArgumentError("replicate_ids contains duplicate values: $selected_replicates"))
+
+    available_pairs = Set(zip(Int.(manifest.sim), Int.(manifest.replicate)))
+    missing_pairs = [
+        (sim=sim, replicate=replicate)
+        for sim in Int.(selected_simulations)
+        for replicate in selected_replicates
+        if (sim, replicate) ∉ available_pairs
+    ]
+    isempty(missing_pairs) ||
+        error("Requested simulation/replicate rows were not found: $(join(missing_pairs, ", "))")
+
+    keep = in(Set(selected_replicates)).(Int.(manifest.replicate))
+    return manifest[keep, :]
+end
+
+"""
+    select_ranked_omnibus_multi_simulations(
+        manifest, ranked_simulations, count; replicate_ids=nothing
+    )
+
+Select rows belonging to the top `count` base simulations in a
+`ranked_simulations.csv` file. By default all replicates are selected; pass
+`replicate_ids` to select specific replicates. The returned manifest follows
+`suitability_rank` order and includes the ranking columns, so the exact compute
+allocation is recorded in the output manifest.
+"""
+function select_ranked_omnibus_multi_simulations(
+    manifest::DataFrame,
+    ranked_simulations,
+    count::Int,
+    ;
+    replicate_ids=nothing,
+)
+    count > 0 || throw(ArgumentError("ranked simulation count must be positive; got $count"))
+
+    ranked_df = if ranked_simulations isa AbstractString
+        isfile(ranked_simulations) || error("Ranked simulations file was not found: $ranked_simulations")
+        DataFrame(CSV.File(ranked_simulations))
+    elseif ranked_simulations isa DataFrame
+        copy(ranked_simulations)
+    else
+        throw(ArgumentError("ranked_simulations must be a CSV path or a DataFrame"))
+    end
+
+    manifest_names = Set(Symbol.(names(manifest)))
+    :sim in manifest_names || throw(ArgumentError("Manifest must contain a :sim column to use ranked selection"))
+
+    ranked_names = Set(Symbol.(names(ranked_df)))
+    required = [:simulation_id, :suitability_rank]
+    all(name -> name in ranked_names, required) ||
+        throw(ArgumentError("Ranked simulations must contain columns $(required). Found columns: $(names(ranked_df))"))
+
+    ranked_df[!, :simulation_id] = Int.(ranked_df[!, :simulation_id])
+    ranked_df[!, :suitability_rank] = Int.(ranked_df[!, :suitability_rank])
+    length(unique(ranked_df.simulation_id)) == nrow(ranked_df) ||
+        throw(ArgumentError("Ranked simulations contain duplicate simulation_id values"))
+    length(unique(ranked_df.suitability_rank)) == nrow(ranked_df) ||
+        throw(ArgumentError("Ranked simulations contain duplicate suitability_rank values"))
+
+    sort!(ranked_df, :suitability_rank)
+    count <= nrow(ranked_df) ||
+        throw(ArgumentError("Requested $count ranked simulations, but only $(nrow(ranked_df)) are available"))
+    selected_ranks = first(ranked_df, count)
+
+    missing_sims = setdiff(selected_ranks.simulation_id, unique(Int.(manifest.sim)))
+    isempty(missing_sims) ||
+        error("Ranked simulations were not found in the discovered manifest: $(join(missing_sims, ", "))")
+
+    # Avoid colliding with the replicate-level manifest's string simulation_id.
+    ranking_metadata = select(selected_ranks, Not(:simulation_id))
+    insertcols!(ranking_metadata, 1, :sim => selected_ranks.simulation_id)
+    selected = innerjoin(manifest, ranking_metadata; on=:sim)
+
+    selected = _select_manifest_replicates(
+        selected,
+        selected_ranks.simulation_id,
+        replicate_ids,
+    )
+
+    sort!(selected, [:suitability_rank, :replicate])
+    return selected
+end
+
+"""
+    select_random_omnibus_multi_simulations(
+        manifest; count=nothing, replicate_ids=nothing, rng_seed=1
+    )
+
+Put base simulations in a deterministic random order and optionally keep only
+the first `count`. The full selection order is independent of replicate choice,
+so a replicate-1 discovery run and later validation runs can use the same base
+simulation order.
+"""
+function select_random_omnibus_multi_simulations(
+    manifest::DataFrame;
+    count::Union{Nothing,Int}=nothing,
+    replicate_ids=nothing,
+    rng_seed::Int=1,
+)
+    manifest_names = Set(Symbol.(names(manifest)))
+    :sim in manifest_names ||
+        throw(ArgumentError("Manifest must contain a :sim column to use random selection"))
+
+    simulations = sort(unique(Int.(manifest.sim)))
+    isempty(simulations) && error("No base simulations were found in the manifest")
+
+    selected_count = count === nothing ? length(simulations) : count
+    selected_count > 0 ||
+        throw(ArgumentError("random simulation count must be positive; got $selected_count"))
+    selected_count <= length(simulations) || throw(ArgumentError(
+        "Requested $selected_count random simulations, but only $(length(simulations)) are available",
+    ))
+
+    rng = MersenneTwister(rng_seed)
+    random_order = simulations[randperm(rng, length(simulations))]
+    selected_simulations = first(random_order, selected_count)
+    order_df = DataFrame(
+        sim=selected_simulations,
+        selection_order=collect(1:selected_count),
+        selection_seed=fill(rng_seed, selected_count),
+        selection_method=fill("uniform_random_without_replacement", selected_count),
+    )
+
+    selected = innerjoin(manifest, order_df; on=:sim)
+    selected = _select_manifest_replicates(
+        selected,
+        selected_simulations,
+        replicate_ids,
+    )
+    sort!(selected, [:selection_order, :replicate])
+    return selected
+end
+
 function select_one_omnibus_multi_simulation(
     rootdir::AbstractString;
     manifest=nothing,
@@ -137,7 +287,12 @@ function select_one_omnibus_multi_simulation(
     return manifest_df[row_ix, :], manifest_df
 end
 
-function _simulation_is_complete(sim_outdir::AbstractString, kernel_stddevs; include_original_bame::Bool=true)
+function _simulation_is_complete(
+    sim_outdir::AbstractString,
+    kernel_stddevs;
+    include_original_bame::Bool=true,
+    include_meme::Bool=true,
+)
     summary_path = joinpath(sim_outdir, "method_sweep_summary.csv")
     isfile(summary_path) || return false
 
@@ -148,6 +303,9 @@ function _simulation_is_complete(sim_outdir::AbstractString, kernel_stddevs; inc
 
     methods = String.(df[!, :method])
     if include_original_bame && !any(methods .== "original_BAME")
+        return false
+    end
+    if include_meme && !any(methods .== "MEME")
         return false
     end
 
@@ -193,12 +351,16 @@ function _load_simulation_inputs(row)
     return seqnames, seqs, treestring, truth_vec, truth_df
 end
 
-function _aggregate_summaries(outdir::AbstractString)
+function _aggregate_summaries(outdir::AbstractString; simulation_ids=nothing)
+    allowed_ids = simulation_ids === nothing ? nothing : Set(String.(simulation_ids))
     summary_files = String[]
     for (dir, _, files) in walkdir(outdir)
         for f in files
             if f == "method_sweep_summary.csv"
-                push!(summary_files, joinpath(dir, f))
+                sim_id = basename(dir)
+                if allowed_ids === nothing || sim_id in allowed_ids
+                    push!(summary_files, joinpath(dir, f))
+                end
             end
         end
     end
@@ -211,10 +373,37 @@ function _aggregate_summaries(outdir::AbstractString)
         push!(rows, df)
     end
 
-    isempty(rows) && return DataFrame()
+    if isempty(rows)
+        agg = DataFrame(simulation_id=String[])
+        CSV.write(joinpath(outdir, "aggregate_summary.csv"), agg)
+        return agg
+    end
     agg = vcat(rows...; cols=:union)
     CSV.write(joinpath(outdir, "aggregate_summary.csv"), agg)
     return agg
+end
+
+function _completed_simulation_ids(
+    manifest_df::DataFrame,
+    outdir::AbstractString,
+    kernel_stddevs;
+    include_original_bame::Bool=true,
+    include_meme::Bool=true,
+)
+    completed = String[]
+    for row in eachrow(manifest_df)
+        simulation_id = String(row.simulation_id)
+        sim_outdir = joinpath(outdir, simulation_id)
+        if _simulation_is_complete(
+            sim_outdir,
+            kernel_stddevs;
+            include_original_bame=include_original_bame,
+            include_meme=include_meme,
+        )
+            push!(completed, simulation_id)
+        end
+    end
+    return completed
 end
 
 function _append_progress(outdir::AbstractString, row)
@@ -228,10 +417,13 @@ function run_simulation_row!(
     outdir::AbstractString;
     kernel_stddevs=Float64[0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
     include_original_bame::Bool=true,
+    include_meme::Bool=true,
+    meme_significance::Float64=0.05,
     bame_method=(sampler=:DirichletEM, concentration=0.1, iterations=2500),
     pos_thresh::Float64=0.9,
     iters::Int=1000,
     burnin::Int=div(iters, 4),
+    n_adapts::Int=burnin,
     n_chains::Int=4,
     base_seed::Union{Nothing,Int}=nothing,
     save_truth_table::Bool=true,
@@ -239,6 +431,7 @@ function run_simulation_row!(
     optimize_branch_lengths::Bool=false,
     fast_reshaping::Bool=true,
     sample_allocations::Bool=false,
+    save_chain_samples::Bool=true,
     skip_completed::Bool=true,
     continue_on_error::Bool=false,
     flavorgrid_kwargs=NamedTuple(),
@@ -247,7 +440,12 @@ function run_simulation_row!(
     sim_outdir = joinpath(outdir, simulation_id)
     mkpath(sim_outdir)
 
-    if skip_completed && _simulation_is_complete(sim_outdir, kernel_stddevs; include_original_bame=include_original_bame)
+    if skip_completed && _simulation_is_complete(
+        sim_outdir,
+        kernel_stddevs;
+        include_original_bame=include_original_bame,
+        include_meme=include_meme,
+    )
         @info "Skipping completed simulation" simulation_id=simulation_id
         return DataFrame(CSV.File(joinpath(sim_outdir, "method_sweep_summary.csv")))
     end
@@ -276,14 +474,24 @@ function run_simulation_row!(
             sim_outdir;
             kernel_stddevs=kernel_stddevs,
             include_original_bame=include_original_bame,
+            include_meme=include_meme,
+            meme_inputs=(
+                seqnames=seqnames,
+                seqs=seqs,
+                treestring=treestring,
+                optimize_branch_lengths=optimize_branch_lengths,
+            ),
+            meme_significance=meme_significance,
             bame_method=bame_method,
             pos_thresh=pos_thresh,
             iters=iters,
             burnin=burnin,
+            n_adapts=n_adapts,
             n_chains=n_chains,
             verbosity=flavorgrid_verbosity,
             fast_reshaping=fast_reshaping,
             sample_allocations=sample_allocations,
+            save_chain_samples=save_chain_samples,
             base_seed=base_seed,
             skip_completed=skip_completed,
         )
@@ -300,6 +508,19 @@ function run_simulation_row!(
 
         return summary_df
     catch err
+        if err isa InterruptException
+            _append_progress(outdir, (
+                timestamp=read_timestamp(),
+                simulation_id=simulation_id,
+                sim_index=sim_index,
+                status="interrupted",
+                start_time=start_time,
+                flavorgrid_elapsed_seconds=NaN,
+                message="Interrupted by user; completed method checkpoints were preserved.",
+            ))
+            rethrow()
+        end
+
         _append_progress(outdir, (
             timestamp=read_timestamp(),
             simulation_id=simulation_id,
@@ -329,16 +550,20 @@ function run_one_omnibus_multi_parameter_sweep(
     rng_seed::Union{Nothing,Int}=nothing,
     kernel_stddevs=Float64[0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
     include_original_bame::Bool=true,
+    include_meme::Bool=true,
+    meme_significance::Float64=0.05,
     bame_method=(sampler=:DirichletEM, concentration=0.1, iterations=2500),
     pos_thresh::Float64=0.9,
     iters::Int=1000,
     burnin::Int=div(iters, 4),
+    n_adapts::Int=burnin,
     n_chains::Int=4,
     base_seed::Union{Nothing,Int}=nothing,
     flavorgrid_verbosity::Int=1,
     optimize_branch_lengths::Bool=false,
     fast_reshaping::Bool=true,
     sample_allocations::Bool=false,
+    save_chain_samples::Bool=true,
     skip_completed::Bool=true,
     continue_on_error::Bool=false,
     update_aggregate::Bool=true,
@@ -363,16 +588,20 @@ function run_one_omnibus_multi_parameter_sweep(
         outdir;
         kernel_stddevs=kernel_stddevs,
         include_original_bame=include_original_bame,
+        include_meme=include_meme,
+        meme_significance=meme_significance,
         bame_method=bame_method,
         pos_thresh=pos_thresh,
         iters=iters,
         burnin=burnin,
+        n_adapts=n_adapts,
         n_chains=n_chains,
         base_seed=base_seed,
         flavorgrid_verbosity=flavorgrid_verbosity,
         optimize_branch_lengths=optimize_branch_lengths,
         fast_reshaping=fast_reshaping,
         sample_allocations=sample_allocations,
+        save_chain_samples=save_chain_samples,
         skip_completed=skip_completed,
         continue_on_error=continue_on_error,
         flavorgrid_kwargs=flavorgrid_kwargs,
@@ -387,18 +616,28 @@ function run_all_omnibus_multi_parameter_sweep(
     rootdir::AbstractString,
     outdir::AbstractString;
     manifest=nothing,
+    ranked_simulations=nothing,
+    ranked_simulation_count::Union{Nothing,Int}=nothing,
+    randomize_simulations::Bool=false,
+    random_simulation_count::Union{Nothing,Int}=nothing,
+    simulation_selection_seed::Int=1,
+    replicate_ids=nothing,
     kernel_stddevs=Float64[0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
     include_original_bame::Bool=true,
+    include_meme::Bool=true,
+    meme_significance::Float64=0.05,
     bame_method=(sampler=:DirichletEM, concentration=0.1, iterations=2500),
     pos_thresh::Float64=0.9,
     iters::Int=1000,
     burnin::Int=div(iters, 4),
+    n_adapts::Int=burnin,
     n_chains::Int=4,
     base_seed::Union{Nothing,Int}=nothing,
     flavorgrid_verbosity::Int=1,
     optimize_branch_lengths::Bool=false,
     fast_reshaping::Bool=true,
     sample_allocations::Bool=false,
+    save_chain_samples::Bool=true,
     skip_completed::Bool=true,
     continue_on_error::Bool=true,
     update_aggregate_each_simulation::Bool=true,
@@ -406,7 +645,43 @@ function run_all_omnibus_multi_parameter_sweep(
 )
     mkpath(outdir)
     manifest_df = _resolve_manifest(rootdir; manifest=manifest)
+    use_random_selection = randomize_simulations || random_simulation_count !== nothing
+    if ranked_simulation_count !== nothing && use_random_selection
+        throw(ArgumentError(
+            "Ranked and random simulation selection are mutually exclusive. " *
+            "Set either RANKED_SIMULATION_COUNT or RANDOMIZE_SIMULATIONS/RANDOM_SIMULATION_COUNT.",
+        ))
+    elseif use_random_selection
+        manifest_df = select_random_omnibus_multi_simulations(
+            manifest_df;
+            count=random_simulation_count,
+            replicate_ids=replicate_ids,
+            rng_seed=simulation_selection_seed,
+        )
+        @info "Selected simulations in fixed random order" base_simulations=length(unique(manifest_df.sim)) selection_seed=simulation_selection_seed replicate_ids=replicate_ids replicate_runs=nrow(manifest_df)
+    elseif ranked_simulation_count !== nothing
+        ranked_simulations === nothing &&
+            throw(ArgumentError("ranked_simulations is required when ranked_simulation_count is set"))
+        manifest_df = select_ranked_omnibus_multi_simulations(
+            manifest_df,
+            ranked_simulations,
+            ranked_simulation_count,
+            replicate_ids=replicate_ids,
+        )
+        @info "Selected ranked simulations" base_simulations=ranked_simulation_count replicate_ids=replicate_ids replicate_runs=nrow(manifest_df)
+    end
     CSV.write(joinpath(outdir, "manifest.csv"), manifest_df)
+
+    aggregate_completed_simulations() = _aggregate_summaries(
+        outdir;
+        simulation_ids=_completed_simulation_ids(
+            manifest_df,
+            outdir,
+            kernel_stddevs;
+            include_original_bame=include_original_bame,
+            include_meme=include_meme,
+        ),
+    )
 
     for (sim_index, row) in enumerate(eachrow(manifest_df))
         run_simulation_row!(
@@ -415,23 +690,27 @@ function run_all_omnibus_multi_parameter_sweep(
             outdir;
             kernel_stddevs=kernel_stddevs,
             include_original_bame=include_original_bame,
+            include_meme=include_meme,
+            meme_significance=meme_significance,
             bame_method=bame_method,
             pos_thresh=pos_thresh,
             iters=iters,
             burnin=burnin,
+            n_adapts=n_adapts,
             n_chains=n_chains,
             base_seed=base_seed,
             flavorgrid_verbosity=flavorgrid_verbosity,
             optimize_branch_lengths=optimize_branch_lengths,
             fast_reshaping=fast_reshaping,
             sample_allocations=sample_allocations,
+            save_chain_samples=save_chain_samples,
             skip_completed=skip_completed,
             continue_on_error=continue_on_error,
             flavorgrid_kwargs=flavorgrid_kwargs,
         )
 
-        update_aggregate_each_simulation && _aggregate_summaries(outdir)
+        update_aggregate_each_simulation && aggregate_completed_simulations()
     end
 
-    return _aggregate_summaries(outdir)
+    return aggregate_completed_simulations()
 end

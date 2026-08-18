@@ -46,9 +46,46 @@ function LogDensityProblems.capabilities(::Type{FUBARLogDensity})
 end
 
 
+function _sample_NUTS_chain(
+    model::GeneralizedFUBARModel,
+    iters::Int64,
+    n_adapts::Int64,
+    max_tree_depth::Int64,
+    rng::AbstractRNG,
+    chain_index::Int;
+    progress::Bool=false,
+)
+    initial_parameters = rand(rng, model.prior)
+    target = FUBARLogDensity(model)
+    metric = DiagEuclideanMetric(model.n_parameters)
+    hamiltonian = Hamiltonian(metric, target, AutoMooncake(; config=nothing))
+
+    println("Finding good epsilon for chain $chain_index...")
+    epsilon = find_good_stepsize(rng, hamiltonian, initial_parameters)
+    println("Chain $chain_index epsilon: $epsilon")
+
+    integrator = Leapfrog(epsilon)
+    termination = GeneralisedNoUTurn(; max_depth=max_tree_depth)
+    kernel = HMCKernel(Trajectory{MultinomialTS}(integrator, termination))
+    adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
+
+    return sample(
+        rng,
+        hamiltonian,
+        kernel,
+        initial_parameters,
+        iters,
+        adaptor,
+        n_adapts;
+        verbose=false,
+        progress=progress,
+    )
+end
+
 """
 # sample_NUTS()
-Samples from the model using NUTS
+Samples from the model using NUTS. Each chain owns its sampler and adaptation
+state so chains can run safely in parallel.
 ## Arguments:
 - model::GeneralizedFUBARModel: The model to sample from.
 - iters::Int64: The number of iterations to sample.
@@ -59,32 +96,55 @@ Samples from the model using NUTS
 - ambient_samples::Vector{Any}: The sampled parameter values. Indexed as 
 - stats::Any: The sampling statistics.
 """
-function sample_NUTS(model::GeneralizedFUBARModel, iters::Int64, n_chains::Int64; n_adapts::Int64=div(iters, 10), progress=false)
+function sample_NUTS(
+    model::GeneralizedFUBARModel,
+    iters::Int64,
+    n_chains::Int64;
+    n_adapts::Int64=div(iters, 10),
+    max_tree_depth::Int64=10,
+    progress=false,
+)
 
-    initial_parameters = rand(model.prior)
-    target = FUBARLogDensity(model)
-    metric = DiagEuclideanMetric(model.n_parameters)
-    hamiltonian = Hamiltonian(metric, target, AutoMooncake(; config=nothing)) # We use mooncake because it is good for the case R^n → R
-    n_adapts = min(n_adapts, iters - 1) 
-    print("finding good epsilon...\n")
-    epsilon = find_good_stepsize(hamiltonian, initial_parameters)
-    integrator = Leapfrog(epsilon)
-    print("Epsilon used: ", epsilon, "\n")
+    iters > 1 || throw(ArgumentError("iters must be greater than 1"))
+    n_chains > 0 || throw(ArgumentError("n_chains must be positive"))
+    max_tree_depth > 0 || throw(ArgumentError("max_tree_depth must be positive"))
+    0 <= n_adapts < iters ||
+        throw(ArgumentError("n_adapts must satisfy 0 <= n_adapts < iters; got n_adapts=$n_adapts, iters=$iters"))
+
     ambient_samples = Vector{Any}(undef, n_chains)
-    kernel = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
-    adaptor = StanHMCAdaptor(MassMatrixAdaptor(metric), StepSizeAdaptor(0.8, integrator))
-    stats = nothing
+    stats = Vector{Any}(undef, n_chains)
+    chain_seeds = rand(Random.default_rng(), UInt64, n_chains)
+
     if n_chains > 1
         Threads.@sync for i in 1:n_chains
             Threads.@spawn begin
-                local_initial = rand(model.prior)
-                local_samples, _ = sample(hamiltonian, kernel, local_initial, iters, adaptor, n_adapts; verbose=false, progress=progress)
+                local_rng = Random.Xoshiro(chain_seeds[i])
+                local_samples, local_stats = _sample_NUTS_chain(
+                    model,
+                    iters,
+                    n_adapts,
+                    max_tree_depth,
+                    local_rng,
+                    i;
+                    progress=progress,
+                )
                 ambient_samples[i] = local_samples
+                stats[i] = local_stats
             end
         end
     else
-        samples, stats = sample(hamiltonian, kernel, initial_parameters, iters, adaptor, n_adapts; verbose=false, progress=progress)
+        local_rng = Random.Xoshiro(only(chain_seeds))
+        samples, chain_stats = _sample_NUTS_chain(
+            model,
+            iters,
+            n_adapts,
+            max_tree_depth,
+            local_rng,
+            1;
+            progress=progress,
+        )
         ambient_samples[1] = samples
+        stats[1] = chain_stats
     end
 
     return ambient_samples, stats

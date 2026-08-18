@@ -20,7 +20,12 @@ end
 
 function _write_summary(path::AbstractString, rows::Vector{NamedTuple})
     mkpath(dirname(path))
-    df = isempty(rows) ? DataFrame() : DataFrame(rows)
+    df = if isempty(rows)
+        DataFrame()
+    else
+        row_frames = DataFrame[DataFrame([row]) for row in rows]
+        reduce((left, right) -> vcat(left, right; cols=:union), row_frames)
+    end
     CSV.write(path, df)
     return df
 end
@@ -30,7 +35,7 @@ function _load_summary_rows(summary_path::AbstractString)
         return NamedTuple[]
     end
     df = DataFrame(CSV.File(summary_path))
-    return [NamedTuple(row) for row in eachrow(df)]
+    return NamedTuple[NamedTuple(row) for row in eachrow(df)]
 end
 
 function _extract_smooth_posterior(df::DataFrame)
@@ -121,6 +126,74 @@ function run_existing_BAME_baseline!(
     )
 end
 
+function run_MEME_baseline!(
+    seqnames,
+    seqs,
+    treestring::AbstractString,
+    truth_vec::Vector{Bool},
+    outdir::AbstractString;
+    significance::Float64=0.05,
+    verbosity::Int=1,
+    optimize_branch_lengths::Bool=false,
+)
+    prefix = joinpath(outdir, "MEME")
+
+    raw_df = CodonMolecularEvolution.MEME(
+        seqnames,
+        seqs,
+        String(treestring),
+        prefix;
+        verbosity=verbosity,
+        exports=false,
+        optimize_branch_lengths=optimize_branch_lengths,
+        significance=significance,
+        round_digits=nothing,
+    )
+
+    nrow(raw_df) == length(truth_vec) ||
+        throw(DimensionMismatch("MEME returned $(nrow(raw_df)) sites; expected $(length(truth_vec))"))
+
+    p_values = Float64.(raw_df[!, "p-value"])
+    scores = clamp.(1.0 .- p_values, 0.0, 1.0)
+    score_threshold = 1.0 - significance
+
+    site_df = copy(raw_df)
+    site_df[!, :meme_score] = scores
+    site_df[!, :threshold] = p_values .<= significance
+    site_df[!, :true_positive] = truth_vec
+    site_df[!, :method] .= "MEME"
+    site_df[!, :kernel_stddev] .= NaN
+    site_df[!, :significance] .= significance
+
+    roc_df, auc = roc_curve_from_scores(scores, truth_vec)
+    pr_df, auprc = pr_curve_from_scores(scores, truth_vec)
+
+    roc_df[!, :method] .= "MEME"
+    roc_df[!, :kernel_stddev] .= NaN
+    pr_df[!, :method] .= "MEME"
+    pr_df[!, :kernel_stddev] .= NaN
+
+    th = threshold_summary(scores, truth_vec, score_threshold)
+
+    CSV.write(prefix * "_site_statistics.csv", site_df)
+    CSV.write(prefix * "_roc.csv", roc_df)
+    CSV.write(prefix * "_pr.csv", pr_df)
+
+    return (
+        method = "MEME",
+        kernel_stddev = NaN,
+        auc = auc,
+        auprc = auprc,
+        n_sites = length(truth_vec),
+        n_true_positive_sites = count(truth_vec),
+        n_called_at_pos_thresh = th.n_called,
+        pos_thresh = score_threshold,
+        tpr_at_pos_thresh = th.tpr,
+        fpr_at_pos_thresh = th.fpr,
+        precision_at_pos_thresh = th.precision,
+    )
+end
+
 function run_smoothFLAVOR_for_kernel_stddev!(
     flavorgrid,
     truth_vec::Vector{Bool},
@@ -129,10 +202,12 @@ function run_smoothFLAVOR_for_kernel_stddev!(
     pos_thresh::Float64=0.9,
     iters::Int=1000,
     burnin::Int=div(iters, 4),
+    n_adapts::Int=burnin,
     n_chains::Int=4,
     verbosity::Int=1,
     fast_reshaping::Bool=true,
     sample_allocations::Bool=false,
+    save_chain_samples::Bool=true,
 )
     σk = Float64(kernel_stddev)
     σk > 0 || throw(ArgumentError("kernel_stddev must be strictly positive; no-smoothing runs are intentionally excluded."))
@@ -145,12 +220,15 @@ function run_smoothFLAVOR_for_kernel_stddev!(
         pos_thresh=pos_thresh,
         iters=iters,
         burnin=burnin,
+        n_adapts=n_adapts,
         n_chains=n_chains,
         verbosity=verbosity,
         exports=false,
         sample_allocations=sample_allocations,
         fast_reshaping=fast_reshaping,
         kernel_stddev=σk,
+        save_chain_diagnostics=true,
+        save_chain_samples=save_chain_samples,
     )
 
     posterior = _extract_smooth_posterior(df)
@@ -182,6 +260,9 @@ function run_smoothFLAVOR_for_kernel_stddev!(
     CSV.write(prefix * "_roc.csv", roc_df)
     CSV.write(prefix * "_pr.csv", pr_df)
 
+    chain_summary = only(eachrow(results.chain_artifacts.posterior.diagnostics_summary))
+    sampler_summary = only(eachrow(results.chain_artifacts.sampler.diagnostics_summary))
+
     return (
         method = "smoothFLAVOR_BAME",
         kernel_stddev = σk,
@@ -194,6 +275,23 @@ function run_smoothFLAVOR_for_kernel_stddev!(
         tpr_at_pos_thresh = th.tpr,
         fpr_at_pos_thresh = th.fpr,
         precision_at_pos_thresh = th.precision,
+        mcmc_iterations = iters,
+        mcmc_burnin = burnin,
+        mcmc_n_adapts = n_adapts,
+        mcmc_n_chains = n_chains,
+        mcmc_retained_per_chain = chain_summary.retained_per_chain,
+        mcmc_max_rhat = chain_summary.max_rhat,
+        mcmc_n_rhat_above_1p01 = chain_summary.n_rhat_above_1p01,
+        mcmc_min_ess_bulk = chain_summary.min_ess_bulk,
+        mcmc_min_ess_tail = chain_summary.min_ess_tail,
+        mcmc_adaptation_numerical_errors = sampler_summary.total_adaptation_numerical_errors,
+        mcmc_retained_numerical_errors = sampler_summary.total_retained_numerical_errors,
+        mcmc_retained_max_tree_depth_hits = sampler_summary.total_retained_max_tree_depth_hits,
+        mcmc_min_ebfmi = sampler_summary.min_retained_ebfmi,
+        mcmc_log_density_rhat = sampler_summary.log_density_rhat,
+        mcmc_log_density_ess_bulk = sampler_summary.log_density_ess_bulk,
+        mcmc_log_density_ess_tail = sampler_summary.log_density_ess_tail,
+        mcmc_log_density_chain_mean_range = sampler_summary.log_density_chain_mean_range,
     )
 end
 
@@ -203,14 +301,19 @@ function run_parameter_sweep_on_flavorgrid!(
     outdir::AbstractString;
     kernel_stddevs=Float64[0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
     include_original_bame::Bool=true,
+    include_meme::Bool=false,
+    meme_inputs=nothing,
+    meme_significance::Float64=0.05,
     bame_method=(sampler=:DirichletEM, concentration=0.1, iterations=2500),
     pos_thresh::Float64=0.9,
     iters::Int=1000,
     burnin::Int=div(iters, 4),
+    n_adapts::Int=burnin,
     n_chains::Int=4,
     verbosity::Int=1,
     fast_reshaping::Bool=true,
     sample_allocations::Bool=false,
+    save_chain_samples::Bool=true,
     base_seed::Union{Nothing,Int}=nothing,
     skip_completed::Bool=true,
 )
@@ -218,6 +321,9 @@ function run_parameter_sweep_on_flavorgrid!(
 
     any(σ -> Float64(σ) <= 0, kernel_stddevs) &&
         throw(ArgumentError("All kernel_stddevs must be strictly positive. Remove 0.0/no-smoothing values."))
+    0 <= n_adapts <= burnin < iters || throw(ArgumentError(
+        "Require 0 <= n_adapts <= burnin < iters; got n_adapts=$n_adapts, burnin=$burnin, iters=$iters",
+    ))
 
     n_sites = size(getproperty(flavorgrid, :prob_matrix), 2)
     truth_vec = truth_to_bool_vector(truth, n_sites)
@@ -246,6 +352,34 @@ function run_parameter_sweep_on_flavorgrid!(
         end
     end
 
+    if include_meme
+        meme_inputs === nothing &&
+            throw(ArgumentError("meme_inputs is required when include_meme=true"))
+        required_meme_inputs = (:seqnames, :seqs, :treestring)
+        all(name -> hasproperty(meme_inputs, name), required_meme_inputs) ||
+            throw(ArgumentError("meme_inputs must contain $(required_meme_inputs)"))
+
+        already_done = skip_completed && _summary_has_method(summary_df, "MEME")
+        if !already_done
+            verbosity > 0 && println("Running MEME baseline.")
+            elapsed = @elapsed meme_summary = run_MEME_baseline!(
+                meme_inputs.seqnames,
+                meme_inputs.seqs,
+                meme_inputs.treestring,
+                truth_vec,
+                outdir;
+                significance=meme_significance,
+                verbosity=verbosity,
+                optimize_branch_lengths=get(meme_inputs, :optimize_branch_lengths, false),
+            )
+            meme_summary = merge(meme_summary, (elapsed_seconds=elapsed,))
+            push!(summary_rows, meme_summary)
+            summary_df = _write_summary(summary_path, summary_rows)
+        else
+            verbosity > 0 && println("Skipping MEME baseline; summary row already exists.")
+        end
+    end
+
     for (j, σ) in enumerate(Float64.(kernel_stddevs))
         already_done = skip_completed && _summary_has_method(summary_df, "smoothFLAVOR_BAME"; kernel_stddev=σ)
         if already_done
@@ -266,10 +400,12 @@ function run_parameter_sweep_on_flavorgrid!(
             pos_thresh=pos_thresh,
             iters=iters,
             burnin=burnin,
+            n_adapts=n_adapts,
             n_chains=n_chains,
             verbosity=verbosity,
             fast_reshaping=fast_reshaping,
             sample_allocations=sample_allocations,
+            save_chain_samples=save_chain_samples,
         )
 
         smooth_summary = merge(smooth_summary, (elapsed_seconds=elapsed,))

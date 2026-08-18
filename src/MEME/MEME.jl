@@ -107,18 +107,36 @@ function MEME_hypotheses_fit(tree::FelNode, seqnames, seqs, GTRmat, F3x4_freqs, 
     return alternative_params, alternative_LLs, null_params, null_LLs
 end
 
-p_value(λ) = 1 - (0.33 + 0.3*cdf(Chisq(1), λ) + 0.37*cdf(Chisq(2), λ)) #Asymptotic (null) distribution of LRT
+p_value(λ) = clamp(
+    1 - (0.33 + 0.3*cdf(Chisq(1), λ) + 0.37*cdf(Chisq(2), λ)),
+    0.0,
+    1.0,
+) # Asymptotic (null) distribution of the LRT.
 
-function MEME_test(alternative_LLs, null_LLs; significance=0.05)
+function MEME_test(
+    alternative_LLs,
+    null_LLs;
+    significance=0.05,
+    verbosity=1,
+    lrt_zero_tolerance=0.001,
+)
+    0.0 < significance <= 1.0 || throw(ArgumentError("significance must be in (0, 1]"))
+    lrt_zero_tolerance >= 0.0 || throw(ArgumentError("lrt_zero_tolerance must be nonnegative"))
+
     num_sites = length(alternative_LLs)
+    length(null_LLs) == num_sites ||
+        throw(DimensionMismatch("alternative_LLs and null_LLs must have the same length"))
     LRTs = Vector{Float64}(undef, num_sites)
     p_values = Vector{Float64}(undef, num_sites)
     for (site, (alternative_LL, null_LL)) in enumerate(zip(alternative_LLs, null_LLs))
         λ = 2 * (alternative_LL - null_LL)
+        # Match the numerical tolerance used to derive the paper's null
+        # distribution and guard against tiny negative optimizer differences.
+        λ = λ < lrt_zero_tolerance ? 0.0 : λ
         p = p_value(λ)
         LRTs[site] = λ
         p_values[site] = p
-        if p < significance
+        if verbosity > 0 && p < significance
             #Report that some branches have episodic diversifying selection at site
             println("Site $(site): p-value of the LRT = $(round(p,digits=4))");
         end
@@ -126,7 +144,15 @@ function MEME_test(alternative_LLs, null_LLs; significance=0.05)
     return LRTs, p_values
 end
 
-function MEME_tabulate(LRTs, p_values, alternative_params, alternative_LLs, outpath, exports)
+function MEME_tabulate(
+    LRTs,
+    p_values,
+    alternative_params,
+    alternative_LLs,
+    outpath,
+    exports;
+    round_digits::Union{Nothing,Integer}=2,
+)
     df = DataFrame()
     df."site" = 1:length(p_values)
     df."α" = [alt.alpha for alt in alternative_params]
@@ -138,10 +164,12 @@ function MEME_tabulate(LRTs, p_values, alternative_params, alternative_LLs, outp
     df."p-value" = p_values
     df."MEME LogL" = alternative_LLs
 
-    # Round all numerical values to 2 decimal places
-    for col in names(df)
-        if eltype(df[!, col]) <: AbstractFloat
-            df[!, col] = round.(df[!, col], digits=2)
+    if round_digits !== nothing
+        round_digits >= 0 || throw(ArgumentError("round_digits must be nonnegative or nothing"))
+        for col in names(df)
+            if eltype(df[!, col]) <: AbstractFloat
+                df[!, col] = round.(df[!, col], digits=round_digits)
+            end
         end
     end
     exports && CSV.write(outpath*"_SelectionOutput.csv",df)
@@ -149,13 +177,43 @@ function MEME_tabulate(LRTs, p_values, alternative_params, alternative_LLs, outp
 end
 
 export MEME
-function MEME(seqnames, seqs, treestring, outpath; verbosity=1, exports=true, code=MolecularEvolution.universal_code, optimize_branch_lengths=false, significance=0.05)
+function MEME(
+    seqnames,
+    seqs,
+    treestring,
+    outpath;
+    verbosity=1,
+    exports=true,
+    code=MolecularEvolution.universal_code,
+    optimize_branch_lengths=false,
+    significance=0.05,
+    round_digits::Union{Nothing,Integer}=2,
+)
     exports && init_path(outpath)
-    tree, alpha, beta, GTRmat, F3x4_freqs, eq_freqs = MEME_global_fit(seqnames, seqs, treestring,
-    verbosity=verbosity, code=code, optimize_branch_lengths=optimize_branch_lengths)
+    tree, _, alpha, beta, GTRmat, F3x4_freqs, eq_freqs = MEME_global_fit(
+        seqnames,
+        seqs,
+        treestring;
+        verbosity=verbosity,
+        code=code,
+        optimize_branch_lengths=optimize_branch_lengths,
+    )
     alternative_params, alternative_LLs, null_params, null_LLs = MEME_hypotheses_fit(tree::FelNode, seqnames, seqs, GTRmat, F3x4_freqs, eq_freqs, code, verbosity = verbosity)
-    LRTs, p_values = MEME_test(alternative_LLs, null_LLs, significance=significance)
-    df = MEME_tabulate(LRTs, p_values, alternative_params, alternative_LLs, outpath, exports)
+    LRTs, p_values = MEME_test(
+        alternative_LLs,
+        null_LLs;
+        significance=significance,
+        verbosity=verbosity,
+    )
+    df = MEME_tabulate(
+        LRTs,
+        p_values,
+        alternative_params,
+        alternative_LLs,
+        outpath,
+        exports;
+        round_digits=round_digits,
+    )
     #TODO: Branch test?
     return df
 end

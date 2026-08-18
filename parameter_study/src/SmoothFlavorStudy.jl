@@ -21,6 +21,8 @@ export
     read_fasta_simple,
     validate_alignment_for_flavor,
     discover_omnibus_multi_simulations,
+    select_ranked_omnibus_multi_simulations,
+    select_random_omnibus_multi_simulations,
     select_one_omnibus_multi_simulation,
     run_one_omnibus_multi_parameter_sweep,
     run_all_omnibus_multi_parameter_sweep,
