@@ -151,6 +151,33 @@ function sample_NUTS(
 end
 
 
+abstract type GaussianSmoothingMethod end
+
+"""
+    TruncatedGaussianConvolution()
+
+Apply the legacy fixed-width Gaussian convolution to ambient logits.
+"""
+struct TruncatedGaussianConvolution <: GaussianSmoothingMethod end
+
+"""
+    GaussianCovarianceSmoothing(jitter=1e-6)
+
+Construct a full Gaussian correlation matrix independently along every smoothed
+grid dimension, add a diagonal nugget while preserving unit marginal variance,
+and apply its Cholesky factor. This is the default smoothing geometry for
+smoothFLAVOR.
+"""
+struct GaussianCovarianceSmoothing{T<:Real} <: GaussianSmoothingMethod
+    jitter::T
+
+    function GaussianCovarianceSmoothing(jitter::T=1e-6) where {T<:Real}
+        jitter > zero(jitter) ||
+            throw(ArgumentError("Gaussian covariance jitter must be positive; got $jitter"))
+        return new{T}(jitter)
+    end
+end
+
 """
 AmbientToParameterTransform
 An object that describes a callable transform from ambient space to parameter space
@@ -161,14 +188,16 @@ codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameter
 kernel_dim::Int64: The dimensionality of the kernel parameters.
 suppression_dim::Int64: The dimensionality of the suppression parameters.
 kernel_stddev<:Real: The standard deviation for the kernel parameters.
-suppression_stddev<:Real: The standard deviation for the suppression parameters."""
-struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real,D<:Tuple}
+suppression_stddev<:Real: The standard deviation for the suppression parameters.
+smoothing_method<:GaussianSmoothingMethod: The geometry used to correlate ambient logits."""
+struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real,D<:Tuple,M<:GaussianSmoothingMethod}
     reshaping_scheme::S
     kernel_dim::Int
     suppression_dim::Int
     kernel_stddev::T
     suppression_stddev::T
     smoothing_dims::D
+    smoothing_method::M
 end
 
 
@@ -195,6 +224,64 @@ function AmbientToParameterTransform(
     )
 end
 
+function AmbientToParameterTransform(
+    reshaping_scheme::S,
+    kernel_dim::Int,
+    suppression_dim::Int,
+    kernel_stddev::T,
+    suppression_stddev::T,
+    smoothing_dims::D;
+    smoothing_method::M=TruncatedGaussianConvolution(),
+) where {
+    S<:ProbabilityVectorReshapingScheme,
+    T<:Real,
+    D<:Tuple,
+    M<:GaussianSmoothingMethod,
+}
+    return AmbientToParameterTransform{S,T,D,M}(
+        reshaping_scheme,
+        kernel_dim,
+        suppression_dim,
+        kernel_stddev,
+        suppression_stddev,
+        smoothing_dims,
+        smoothing_method,
+    )
+end
+
+"""
+# transform_ambient_components(transform::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
+Transforms an ambient sample and returns the kernel, suppression, and smoothed
+logit components without concatenating them into an intermediate vector.
+"""
+function transform_ambient_components(
+    t::AmbientToParameterTransform,
+    ambient_sample::AbstractVector{<:Real},
+)
+    kernel_end = t.kernel_dim
+    suppression_end = kernel_end + t.suppression_dim
+    @views begin
+        ambient_kernel_parameters = ambient_sample[1:kernel_end]
+        ambient_suppression_parameters = ambient_sample[kernel_end+1:suppression_end]
+        ambient_unsuppressed_parameters = ambient_sample[suppression_end+1:end]
+    end
+
+    kernel_parameters = t.kernel_stddev .* ambient_kernel_parameters
+    suppression_parameters = if t.suppression_dim == 0
+        ambient_suppression_parameters
+    else
+        t.suppression_stddev .* ambient_suppression_parameters
+    end
+    smoothed_parameters = apply_smoothing(
+        t.reshaping_scheme,
+        ambient_unsuppressed_parameters,
+        kernel_parameters;
+        dims=t.smoothing_dims,
+        smoothing_method=t.smoothing_method,
+    )
+    return kernel_parameters, suppression_parameters, smoothed_parameters
+end
+
 """
 # transform_ambient_sample(transform::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
 Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
@@ -205,13 +292,9 @@ AbstractVector{<:Real}: The transformed parameters with covariance structure mat
 (kernel_parameters, suppression_parameters, unsuppressed_parameters).
 """
 function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
-    kernel_parameters = ambient_sample[1:t.kernel_dim]
-    suppression_parameters = ambient_sample[t.kernel_dim+1:t.kernel_dim+t.suppression_dim]
-    ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
-    kernel_parameters = t.kernel_stddev * kernel_parameters
-    suppression_parameters = t.suppression_stddev * suppression_parameters
-    #return vcat(kernel_parameters, suppression_parameters, ambient_unsuppressed_parameters) # TODO: this is short circuited for debugging.
-    return vcat(kernel_parameters, suppression_parameters, apply_smoothing(t.reshaping_scheme, ambient_unsuppressed_parameters, kernel_parameters, dims=t.smoothing_dims))
+    kernel_parameters, suppression_parameters, smoothed_parameters =
+        transform_ambient_components(t, ambient_sample)
+    return vcat(kernel_parameters, suppression_parameters, smoothed_parameters)
 end
 
 """
@@ -377,8 +460,10 @@ model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
 """
 function to_probability_vector(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
 
-    parameters = transform_ambient_sample(model.ambient_to_parameter_transform, ambient_sample)
-    _, suppression_parameters, unsuppressed_parameters = split_parameters(model, parameters)
+    _, suppression_parameters, unsuppressed_parameters = transform_ambient_components(
+        model.ambient_to_parameter_transform,
+        ambient_sample,
+    )
     probability_vector = softmax(unsuppressed_parameters)
     if model.suppression_dim == 0 # The unsuppressed case
         return probability_vector
@@ -408,7 +493,7 @@ model.kernel_dim, model.suppression_dim, model.unsuppressed_dim respectively.
 """
 function log_likelihood(model::SKBDIModel, ambient_sample::AbstractVector{<:Real})
     probability_vector = to_probability_vector(model, ambient_sample)
-    return sum(log.(model.con_lik_matrix' * probability_vector))
+    return sum(log, model.con_lik_matrix' * probability_vector)
 end
 
 

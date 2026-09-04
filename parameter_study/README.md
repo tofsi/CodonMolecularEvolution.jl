@@ -290,20 +290,44 @@ The default output directory is `publication_results/` under the result root.
 Override it with `RESULT_ANALYSIS_DIR`. Outputs include:
 
 ```text
-paired_performance_differences.{png,pdf,svg}
-roc_curves_by_simulation.{png,pdf,svg}
-pr_curves_by_simulation.{png,pdf,svg}
-mcmc_diagnostics.{png,pdf,svg}
+aggregate_roc_curves.{png,pdf,svg}
+aggregate_pr_curves.{png,pdf,svg}
+aggregate_auc.{png,pdf,svg}
+aggregate_runtime_mcmc_diagnostics.{png,pdf,svg}
 analysis_manifest.csv
-paired_performance.csv
-kernel_effect_summary.csv
+per_simulation_auc.csv
+aggregate_auc_summary.csv
+aggregate_roc_curves.csv
+aggregate_pr_curves.csv
+aggregate_runtime_mcmc_summary.csv
 ```
 
-The primary performance figure plots within-simulation changes in ROC AUC and
-PR AUC relative to FLAVOR (stored internally as `original_BAME`). This keeps
-the simulation, rather than each site, as the comparison unit. The curve
-figures retain separate panels per simulation instead of averaging curves
-across heterogeneous simulations.
+The ROC and precision-recall figures are macro-averages: every included
+simulation is interpolated onto a common axis and contributes equal weight to
+the mean curve. Their light ribbons and matching dashed boundaries are
+pointwise confidence intervals; solid lines show the means. Method colors use
+the Okabe-Ito palette for common forms of color-vision deficiency. The AUC
+figure reports mean ROC AUC and PR AUC with confidence-interval error bars and
+faint points for the contributing simulations. By default, all intervals are
+two-sided 95% bias-corrected and accelerated (BCa) bootstrap intervals across
+simulations, so the simulation rather than each site is the resampling unit.
+The same seeded resamples are used for every method to preserve pairing. Set
+`RESULT_CONFIDENCE_LEVEL` to change the level, `RESULT_BOOTSTRAP_SAMPLES` to
+change the default 10,000 resamples, or `RESULT_BOOTSTRAP_SEED` to change the
+default seed `20260904`.
+
+Only simulations containing Original BAME, every requested smoothFLAVOR
+kernel, and all corresponding ROC and PR files enter the aggregates. This
+keeps every method comparison paired on the same set of complete simulations.
+The CSV summaries also report the between-simulation standard deviation and
+standard error used to construct the confidence intervals.
+
+The runtime/MCMC figure shows every simulation as a faint point and the median
+and interquartile range as the larger point and whiskers. Runtime is displayed
+on a logarithmic scale and includes FLAVOR for direct comparison. The MCMC
+panels contain smoothFLAVOR only because FLAVOR does not use the MCMC sampler.
+Dashed reference lines mark R-hat 1.01 and ESS 100. The associated CSV includes
+additional sampler summaries that are not all shown in the figure.
 
 The JLD2 file stores all per-chain ambient samples, including the adaptation
 and burn-in portion, together with `burnin`, `n_adapts`, and parameter names.

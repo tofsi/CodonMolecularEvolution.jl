@@ -92,6 +92,7 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     normalized::Bool=true,
     kernel_dim::Int=1,
     kernel_stddev::Real=4.0,
+    covariance_jitter::Real=1e-6,
     suppress::Bool=false,
     fast_reshaping::Bool=true,
     suppression_stddev::Real=2.0,
@@ -112,6 +113,7 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
         kernel_stddev,
         suppress ? suppression_stddev : 0.0,
         (1, 3),  # μ, α; do not smooth shape, "capped"
+        smoothing_method=GaussianCovarianceSmoothing(covariance_jitter),
     ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
 
     # ambient_to_parameter_transform = identity
@@ -181,15 +183,22 @@ function summarize_smoothFLAVOR_BAME(
             n_used += 1
 
             for s in 1:n_sites
-                @inbounds v .= θ .* con_lik[:, s]
-                z = sum(v)
+                z = 0.0
+                @inbounds @simd for k in 1:n_categories
+                    weight = θ[k] * con_lik[k, s]
+                    v[k] = weight
+                    z += weight
+                end
 
                 # Should not happen if con_lik columns are valid, but guard anyway
                 if z <= 0
                     continue
                 end
 
-                @inbounds posterior_mat[:, s] .+= v ./ z
+                inverse_z = inv(z)
+                @inbounds @simd for k in 1:n_categories
+                    posterior_mat[k, s] += v[k] * inverse_z
+                end
 
                 if sample_allocations
                     k = sample(1:n_categories, Weights(v))
@@ -501,6 +510,7 @@ function smoothFLAVOR_BAME(
     burnin=div(iters, 4),
     n_adapts=burnin,
     kernel_stddev=4.0,
+    covariance_jitter=1e-6,
     n_chains=4,
     max_tree_depth=10,
     verbosity=1,
@@ -516,7 +526,12 @@ function smoothFLAVOR_BAME(
         "burnin must satisfy n_adapts <= burnin < iters; got n_adapts=$n_adapts, burnin=$burnin, iters=$iters",
     ))
 
-    sk_model = SKBDIModel_from_FLAVOR(flavorgrid, kernel_stddev = kernel_stddev, fast_reshaping=fast_reshaping)
+    sk_model = SKBDIModel_from_FLAVOR(
+        flavorgrid;
+        kernel_stddev=kernel_stddev,
+        covariance_jitter=covariance_jitter,
+        fast_reshaping=fast_reshaping,
+    )
     fubar_model = GeneralizedFUBARModel(sk_model)
 
     if verbosity > 0
