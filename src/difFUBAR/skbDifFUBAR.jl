@@ -1,15 +1,16 @@
 
 
 """
-# GeneralizedFUBARModel
-A general framework for the class of models to which FUBAR and skbdi belong.
-## Fields
-- n_parameters: Number of parameters in the model
-- n_categories: Number of categories in the model
-- log_likelihood: log likelihood for a probability vector for the categories
-- to_probability_vector: returns the probability vector for a given set of parameters
-- prior: the prior distribution in parameter space.
-- con_lik_matrix: the matrix of conditional distributions for the sites.
+    GeneralizedFUBARModel
+
+A sampling interface shared by grid-based FUBAR models, including
+smoothFLAVOR.
+
+`n_parameters` is the dimension of the sampled parameter vector and
+`n_categories` is the number of mixture categories. `log_likelihood` evaluates
+sampled parameters, `to_probability_vector` maps them to category weights,
+`prior` is their sampling-space prior, and `con_lik_matrix` contains
+category-by-site conditional likelihoods.
 """
 struct GeneralizedFUBARModel
     n_parameters::Int64
@@ -26,8 +27,9 @@ function log_posterior(model::GeneralizedFUBARModel, parameters::AbstractVector{
 end
 
 """
-FUBARLogDensity
-This struct implements the LogDensityProblems interface for the FUBAR model.
+    FUBARLogDensity(model)
+
+Adapt a [`GeneralizedFUBARModel`](@ref) to the `LogDensityProblems` interface.
 """
 struct FUBARLogDensity
     model::GeneralizedFUBARModel
@@ -83,18 +85,19 @@ function _sample_NUTS_chain(
 end
 
 """
-# sample_NUTS()
-Samples from the model using NUTS. Each chain owns its sampler and adaptation
-state so chains can run safely in parallel.
-## Arguments:
-- model::GeneralizedFUBARModel: The model to sample from.
-- iters::Int64: The number of iterations to sample.
-- n_chains::Int64: The number of chains to use for sampling.
-- n_adapts::Int Number of adaptation steps
-- progress::Bool: Whether to show progress bars.
-## Returns:
-- ambient_samples::Vector{Any}: The sampled parameter values. Indexed as 
-- stats::Any: The sampling statistics.
+    sample_NUTS(model, iters, n_chains;
+        n_adapts=div(iters, 10), max_tree_depth=10, progress=false)
+
+Sample a [`GeneralizedFUBARModel`](@ref) with the No-U-Turn Sampler.
+
+Each chain owns independent random-number, Hamiltonian, and adaptation state.
+Multiple chains run as Julia tasks and can execute concurrently when multiple
+threads are available. `iters` includes the `n_adapts` adaptation draws, and
+`max_tree_depth` limits the NUTS trajectory depth.
+
+Returns `(ambient_samples, stats)`, each a vector indexed by chain. A chain in
+`ambient_samples` is a sequence of sampled parameter vectors; the matching
+entry in `stats` contains one `AdvancedHMC` transition statistic per iteration.
 """
 function sample_NUTS(
     model::GeneralizedFUBARModel,
@@ -163,10 +166,11 @@ struct TruncatedGaussianConvolution <: GaussianSmoothingMethod end
 """
     GaussianCovarianceSmoothing(jitter=1e-6)
 
-Construct a full Gaussian correlation matrix independently along every smoothed
-grid dimension, add a diagonal nugget while preserving unit marginal variance,
-and apply its Cholesky factor. This is the default smoothing geometry for
-smoothFLAVOR.
+Use full Gaussian correlation independently along each smoothed grid dimension.
+
+The transformation adds a diagonal nugget while preserving unit marginal
+variance, then applies the covariance's Cholesky factor to independent ambient
+logits. This is the smoothing geometry used by smoothFLAVOR.
 """
 struct GaussianCovarianceSmoothing{T<:Real} <: GaussianSmoothingMethod
     jitter::T
@@ -179,17 +183,17 @@ struct GaussianCovarianceSmoothing{T<:Real} <: GaussianSmoothingMethod
 end
 
 """
-AmbientToParameterTransform
-An object that describes a callable transform from ambient space to parameter space
-Specifically, it is passed to the below function to transform an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-## Fields:
-reshaping_scheme<:ProbabilityVectorReshapingScheme  Determines how the probability vector is reshaped in the apply_smoothing function.
-codon_param_index_vec::Vector{Vector{Int64}}: The indices of the codon parameters.
-kernel_dim::Int64: The dimensionality of the kernel parameters.
-suppression_dim::Int64: The dimensionality of the suppression parameters.
-kernel_stddev<:Real: The standard deviation for the kernel parameters.
-suppression_stddev<:Real: The standard deviation for the suppression parameters.
-smoothing_method<:GaussianSmoothingMethod: The geometry used to correlate ambient logits."""
+    AmbientToParameterTransform
+
+Describe the mapping from independent standard-normal ambient parameters to
+kernel parameters, optional hypothesis-suppression parameters, and correlated
+category logits.
+
+`reshaping_scheme` maps category order to grid order. `kernel_dim` and
+`suppression_dim` define the leading parts of the ambient vector, whose prior
+scales are `kernel_stddev` and `suppression_stddev`. `smoothing_dims` selects the
+grid axes on which `smoothing_method` correlates the remaining category logits.
+"""
 struct AmbientToParameterTransform{S<:ProbabilityVectorReshapingScheme,T<:Real,D<:Tuple,M<:GaussianSmoothingMethod}
     reshaping_scheme::S
     kernel_dim::Int
@@ -250,9 +254,10 @@ function AmbientToParameterTransform(
 end
 
 """
-# transform_ambient_components(transform::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
-Transforms an ambient sample and returns the kernel, suppression, and smoothed
-logit components without concatenating them into an intermediate vector.
+    transform_ambient_components(transform, ambient_sample)
+
+Transform an ambient sample and return its scaled kernel parameters, scaled
+suppression parameters, and smoothed category logits as separate vectors.
 """
 function transform_ambient_components(
     t::AmbientToParameterTransform,
@@ -283,13 +288,11 @@ function transform_ambient_components(
 end
 
 """
-# transform_ambient_sample(transform::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
-Transforms an ambient sample (~N(0, I)) into the parameter space (~N(0, Sigma)).
-## Parameters
-ambient_sample::AbstractVector{<:Real}: The ambient sample to transform.
-## Returns:
-AbstractVector{<:Real}: The transformed parameters with covariance structure matching the model, of the same shape as the ambient sample 
-(kernel_parameters, suppression_parameters, unsuppressed_parameters).
+    transform_ambient_sample(transform, ambient_sample)
+
+Map an independent standard-normal ambient sample to the model parameter space.
+The result concatenates the scaled kernel parameters, scaled suppression
+parameters, and smoothed category logits in that order.
 """
 function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample::AbstractVector{<:Real})
     kernel_parameters, suppression_parameters, smoothed_parameters =
@@ -298,31 +301,20 @@ function transform_ambient_sample(t::AmbientToParameterTransform, ambient_sample
 end
 
 """
-# SKBDIModel: 
-holds the model parameters for
-a general skbdi model.
-## Fields:
-- parameter_grids: A vector of vectors, where each inner vector contains 
-                 the parameter values for a specific grid.
-- parameter_names: A vector of strings, where each string is the name 
-                 of a parameter corresponding to the parameter values in parameter_grids.
-- hypothesis_masks: A matrix of booleans with mask[hypothesis, category] = true 
-       if the hypothesis is true for the category.
-- transition_functions: A vector of transition functions F:R -> [0, 1] for the skbdi model
-- log_con_lik_matrix: A matrix of log likelihoods for each category.
-- con_lik_matrix: A matrix of likelihoods for each category.
-- codon_param_vec: A vector of vectors indexed category, parameter containing
-                 parameter values for each category
-- codon_param_index_vec: A vector of integers indexed category, parameter containing the indices 
-                       in the parameter grids for each category.
-- ambient_to_parameter_transform: An object that describes the transform from ambient to parameter space.
-- kernel_dim: The number of kernel parameters.
-- grid_sizes: A tuple of integers representing the sizes of the grids for each parameter.
-- masks: The disjoint masks used by the model when applying suppression parameters.
-- suppression_dim: The number of suppression parameters.
-- unsuppressed_dim: The number of unsuppressed parameters.
-- total_dim: The total number of parameters in the model.
-- n_codon_parameters: The number of codon parameters (e.g. alpha, beta, omega_1) in the model.
+    SKBDIModel
+
+Store a smoothed, kernel-based discrete mixture model.
+
+The parameter grids and category metadata connect each likelihood-matrix row to
+its biological parameter values. `hypothesis_masks` optionally identify
+categories whose logits can be suppressed; `transition_function` maps each
+suppression parameter to its effect. `ambient_to_parameter_transform` correlates
+ambient category logits according to the grid geometry.
+
+The derived fields `masks`, `mask_subset_indicators`, `suppression_dim`,
+`unsuppressed_dim`, `total_dim`, and `n_codon_parameters` describe the disjoint
+hypotheses and sampled-vector dimensions. Here `unsuppressed_dim` equals the
+number of mixture categories.
 """
 struct SKBDIModel{TF}
     # Model Parameters:
@@ -348,8 +340,10 @@ end
 
 
 """
-# GeneralizedFUBARModel(model::SKBDIModel)
-Constructor for creating a GeneralizedFUBARModel from a SKBDIModel.
+    GeneralizedFUBARModel(model::SKBDIModel)
+
+Wrap an [`SKBDIModel`](@ref) in the common sampling interface with an
+independent standard-normal ambient prior.
 """
 function GeneralizedFUBARModel(model::SKBDIModel)
     return GeneralizedFUBARModel(
@@ -499,18 +493,10 @@ end
 
 
 """
-# calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,ambient_samples::Vector{Vector{Float64}}, burnin::Int; progress=false)
-Samples the allocation grid used for site-wise inference from the ambient samples 
-(see the other diffubar files for details about how alloc_grid is used.)
-TODO: Find a way to make this faster!
-## Parameters:
-- model::GeneralizedFUBARModel: The model to use for the transformation.
-- ambient_samples::Vector{Vector{Float64}}: The ambient samples to transform.
-- burnin::Int: The burn-in period for the MCMC sampler.
-- progress::Bool: Whether to show progress updates.
-## Returns:
-- alloc_grid::Matrix{Int64}: The allocation grid for site-wise inference
-- theta::Vector{Float64}: The estimated posterior probability vector for the model.
+    calculate_alloc_grid_and_theta(model, ambient_samples, burnin; progress=false)
+
+Sample site-category allocations from the draws after `burnin` and return
+`(alloc_grid, theta)`, where `theta` is the mean category-weight vector.
 """
 function calculate_alloc_grid_and_theta(model::GeneralizedFUBARModel,
     ambient_samples::Vector{Vector{Float64}},
@@ -617,7 +603,6 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
             grid_sizes[i] = maximum([index[i] for index in codon_param_index_vec])
         end
         grid_sizes = tuple(grid_sizes...)
-        #square_distance_matrix = generate_square_l2_distance_matrix(codon_param_index_vec)
         suppression_stddev = 1.0
         kernel_stddev = 4.0
 
@@ -672,8 +657,6 @@ function skbdifFUBAR(seqnames, seqs, treestring, tags, outpath, sampler::String;
                 print(size(ambient_samples), " samples drawn from the target distribution.\n")
             elseif sampler == "nuts"
                 ambient_samples, _ = sample_NUTS(fubar_model, iters, n_chains; progress=verbosity > 0)
-                #println(stats)
-                #ambient_samples = [ambient_samples[i] for i in 1:size(ambient_samples, 1)]
             else
                 error("Unknown sampler: $sampler. Use 'ess' or 'nuts'.")
             end

@@ -11,6 +11,8 @@ Documentation for [CodonMolecularEvolution](https://github.com/MurrellGroup/Codo
 Descendant of [MolecularEvolution.jl](https://github.com/MurrellGroup/MolecularEvolution.jl), specializing in codon models.
 
 ### Collection of codon model methods
+- [smoothFLAVOR](@ref): FLAVOR mixture inference with smooth category weights
+    - Uses a Gaussian-correlated logistic-normal prior and NUTS to share information across neighboring `mu` and `alpha` grid categories.
 - [difFUBAR](@ref): Scalable Bayesian comparison of selection pressure
     - Perform a site-wise comparison of evolutionary pressure between two selected sets of branches.
     - Authors: Hassan Sadiq, Venkatesh Kumar, and Ben Murrell (original model development), Patrick Truong (benchmarking), Maximilian Danielsson (performance optimization).

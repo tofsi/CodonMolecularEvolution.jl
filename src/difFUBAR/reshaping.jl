@@ -1,20 +1,24 @@
 """
-ProbabilityVectorReshapingScheme
-This type is used to determine how (un)reshaping probability vector to(from) probability array works.
-(un)reshaping then works by calling (un_)reshape_probability_vector(reshaping_scheme::ProbabilityVectorReshapingScheme, probability_vector(array))
+    ProbabilityVectorReshapingScheme
+
+Abstract interface for mapping category vectors to parameter-grid arrays and
+back. Implementations define [`reshape_probability_vector`](@ref) and
+[`unreshape_probability_vector`](@ref).
 """
 abstract type ProbabilityVectorReshapingScheme end
 
 """
-GeneralCategoricalReshapingScheme
-Works for a general indexation, but makes reshaping slower than for e.g. DifFUBARReshapingScheme
+    GeneralCategoricalReshapingScheme(grid_sizes, codon_param_index_vec)
+
+Represent an arbitrary category order with explicit Cartesian grid indices.
+This is more general, but slower, than a permutation-based reshaping scheme.
 """
 struct GeneralCategoricalReshapingScheme{N,M} <: ProbabilityVectorReshapingScheme
     grid_sizes::NTuple{N,Int}
     codon_param_index_vec::NTuple{M,CartesianIndex{N}}
 end
 
-# Constructor, We convert the codon_param_index_vec to an immutable tuple representation because otherwise it is not handled well by AD
+# Immutable Cartesian indices keep the general scheme compatible with AD.
 function GeneralCategoricalReshapingScheme(
     grid_sizes::NTuple{N,Int},
     codon_param_index_vec::AbstractVector{<:AbstractVector{<:Integer}},
@@ -30,7 +34,7 @@ end
 Fast AD-safe reshaping scheme for probability vectors produced by a nested loop.
 
 `perm` is the permutation passed to `permutedims(tmp, perm)` to turn the
-temporary reshaped array into the desired logical array axis order.
+temporary reshaped array into the desired logical axis order.
 """
 struct PermutedDimsReshapingScheme{N} <: ProbabilityVectorReshapingScheme
     grid_sizes::NTuple{N,Int}
@@ -56,9 +60,9 @@ PermutedDimsReshapingScheme(
 ) where {N} = PermutedDimsReshapingScheme(grid_sizes, Tuple(Int.(perm)))
 
 """
-# reshape_probability_vector(grid_sizes::Tuple, codon_param_index_vec::Vector{Vector{Int64}}, probability_vector::AbstractVector{<:Real})
-Takes a vector with index according to codon_param_index_vec 
-and returns the corresponding multidimensional array with shape according to grid sizes.
+    reshape_probability_vector(scheme, probability_vector)
+
+Map a category-ordered probability vector to its parameter-grid array.
 """
 function reshape_probability_vector(reshaping_scheme::GeneralCategoricalReshapingScheme{N,M}, probability_vector::AbstractVector{T}) where {N,M,T<:Real}
     probability_array = Array{T}(undef, reshaping_scheme.grid_sizes)
@@ -69,8 +73,9 @@ function reshape_probability_vector(reshaping_scheme::GeneralCategoricalReshapin
 end
 
 """
-# unreshape_probability_vector(codon_param_index_vec::Vector{Vector{Int64}}, probability_array::AbstractArray{<:Real})
-Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
+    unreshape_probability_vector(scheme, probability_array)
+
+Map a parameter-grid array back to the category order represented by `scheme`.
 """
 function unreshape_probability_vector(reshaping_scheme::GeneralCategoricalReshapingScheme{N,M}, probability_array::AbstractArray{T}) where {N,M,T<:Real}
     probability_vector = Vector{T}(undef, M)
@@ -96,15 +101,23 @@ function unreshape_probability_vector(
     return vec(permutedims(probability_array, s.invperm))
 end
 
+"""
+    FLAVORReshapingScheme(grid_sizes)
+
+Return the fast, AD-safe scheme for FLAVOR category order.
+
+FLAVOR enumerates categories with `alpha` varying fastest, followed by `shape`,
+`mu`, and finally `capped`. The logical array axes remain
+`(mu, shape, alpha, capped)`. Use [`GeneralCategoricalReshapingScheme`](@ref) for
+categories in any other order.
+"""
 FLAVORReshapingScheme(grid_sizes::NTuple{4,Int}) =
     PermutedDimsReshapingScheme(grid_sizes, (3, 2, 1, 4))
 
-# TODO: Verify that the following struct works for difFUBAR.
-#= difFUBARReshapingScheme(grid_sizes::NTuple{N,Int}) where {N} =
-PermutedDimsReshapingScheme(grid_sizes, ntuple(i -> N - i + 1, N)) =#
 """
-DifFUBARReshapingScheme
-Used specifically in the case when the codon_param_index_vec matches the difFUBAR indexation
+    DifFUBARReshapingScheme(grid_sizes)
+
+Fast reshaping scheme for category vectors in difFUBAR grid order.
 """
 struct DifFUBARReshapingScheme{N} <: ProbabilityVectorReshapingScheme
     grid_sizes::NTuple{N,Int}
@@ -112,9 +125,10 @@ end
 
 
 """
-# reshape_probability_vector(grid_sizes::Tuple, probability_vector::AbstractVector{<:Real})
-Takes a vector with index according to codon_param_index_vec and reshapes it into a multidimensional array based on the grid sizes.
-NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid(), but is fast and AD safe
+    reshape_probability_vector(scheme::DifFUBARReshapingScheme, probability_vector)
+
+Map a difFUBAR-ordered category vector to its parameter-grid array. This fast,
+AD-safe method requires the category order produced by `difFUBAR_grid`.
 """
 function reshape_probability_vector(reshaping_scheme::DifFUBARReshapingScheme, probability_vector::AbstractVector{<:Real})
     return permutedims(reshape(probability_vector, reverse(reshaping_scheme.grid_sizes)...),
@@ -122,9 +136,10 @@ function reshape_probability_vector(reshaping_scheme::DifFUBARReshapingScheme, p
 end
 
 """
-# unreshape_probability_vector()
-Takes a multidimensional array and returns the corresponding vector with index according to codon_param_index_vec.
-NOTE: Only works when the index matches con_lik_mat from difFUBAR_grid, but is fast and AD safe
+    unreshape_probability_vector(scheme::DifFUBARReshapingScheme, probability_array)
+
+Map a parameter-grid array back to the category order produced by
+`difFUBAR_grid`.
 """
 function unreshape_probability_vector(reshaping_scheme::DifFUBARReshapingScheme, probability_array::AbstractArray{<:Real})
     return vec(permutedims(probability_array, reverse(1:length(reshaping_scheme.grid_sizes))))

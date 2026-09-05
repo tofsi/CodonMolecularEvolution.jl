@@ -1,8 +1,13 @@
-#A call should look like
-#f = FLAVORgrid(seqnames, seqs, treestring)
-#FLAVOR(f, outdir)
+"""
+    FLAVORgrid
 
+Conditional-likelihood grid shared by FLAVOR and smoothFLAVOR.
 
+Rows of `prob_matrix` are mixture categories and columns are codon sites.
+`site_scalers` contains the per-site log constants removed while normalizing
+that matrix. Categories consist of every `(mu, shape, alpha)` grid point first
+for uncapped omega distributions and then for capped distributions.
+"""
 struct FLAVORgrid{T} <: BAMEgrid
     tr::Function
     trinv::Function
@@ -15,7 +20,14 @@ struct FLAVORgrid{T} <: BAMEgrid
     site_scalers::Vector{T} # per-site log normalizing constants
 end
 
-#We could perhaps generalize here with a BAMEgrid as well
+"""
+    FLAVORgrid(seqnames, seqs, treestring; verbosity=1,
+        code=MolecularEvolution.universal_code, optimize_branch_lengths=false)
+
+Fit the global codon model and construct the conditional-likelihood grid used by
+[`FLAVOR`](@ref) and smoothFLAVOR. `seqnames` and `seqs` contain the aligned
+sequences, and `treestring` is the corresponding Newick tree.
+"""
 function FLAVORgrid(seqnames::Vector{String}, seqs, treestring::String;
     verbosity=1, code=MolecularEvolution.universal_code, optimize_branch_lengths=false)
     tree = FUBAR_init(treestring, verbosity=verbosity)
@@ -28,14 +40,8 @@ function FLAVORgrid(seqnames::Vector{String}, seqs, treestring::String;
 
     mugrid = gridsetup(0.01, 16.0, 8, trinv, tr)
     shapegrid = gridsetup(0.05, 20, 6, trinv, tr)
-    alphagrid = gridsetup(0.01, 10, 8, trinv, tr) 
+    alphagrid = gridsetup(0.01, 10, 8, trinv, tr)
 
-    #Tiny grid for testing:
-    # mugrid = gridsetup(0.01, 16.0, 3, trinv, tr)
-    # shapegrid = gridsetup(0.05, 20, 3, trinv, tr)
-    # alphagrid = gridsetup(0.01, 10, 3, trinv, tr)
-
-    #mu, shape alpha
     gridpoints = [(mu, shape, alpha) for mu in mugrid for shape in shapegrid for alpha in alphagrid]
     grid_dims = length.([mugrid, shapegrid, alphagrid])
 
@@ -53,31 +59,42 @@ end
 export FLAVORgrid
 
 
-#Converts from Gamma parameters to discrete gamma approximation, using quantiles.
+"""
+    gamma_slices(mu, shape, slices)
+
+Approximate a gamma distribution with equally weighted quantile midpoints.
+"""
 function gamma_slices(mu, shape, slices)
     c = (1 / slices) / 2
     return quantile(Gamma(shape, mu / shape), c:2*c:1-c)
 end
 
-#This will construct a time sequence and a P sequence that you need for the BWMM
-#Note: When doing grid work, other alphas should be obtained without re-running this, by calling "rescale!(model,factor)"
-#I recommend you structure the grid loop so that alpha is on the inner most loop
-#We should write a cleaner version of this that lets you use weights as well
-#Make a version that will work for arbitrary genetics codes
-#Sets up the codon InterpolatedDiscreteModel, based on MG94F3x4
+"""
+    omega_BWMM_matrix_sequence(alpha, omega_vec, nuc_mat, F3x4;
+        t=0.001, n=50, cap=n-15)
+
+Construct the time and transition-matrix sequences for an equally weighted
+mixture of MG94-F3x4 models over `omega_vec`.
+"""
 function omega_BWMM_matrix_sequence(alpha::Float64, omega_vec::Vector{Float64}, nuc_mat::Array{Float64,2}, F3x4::Array{Float64,2}; t=0.001, n=50, cap=n - 15)
     eq_freqs = MolecularEvolution.F3x4_eq_freqs(F3x4)
     Ps = zeros(61, 61, n)
     for o in omega_vec
         Ps .+= (MolecularEvolution.matrix_sequence(MolecularEvolution.MG94_F3x4(alpha, alpha * o, nuc_mat, F3x4), t, n, cap=cap) ./ length(omega_vec))
     end
-    #Some special handling to force eq freqs for numerical infinity - unclear if this matters
+    # Use the equilibrium distribution at the final, effectively infinite time point.
     Ps[:, :, end] .= reshape(repeat(eq_freqs, inner=61, outer=1), 61, 61)
     ts = MolecularEvolution.t_sequence(t, n, cap=cap)
     return ts, Ps
 end
 
-#Model wrapper - returns models function that gets used in eg. felsenstein_up!
+"""
+    construct_GammaBWMM(alpha, mean, shape, nuc_matrix, F3x4;
+        num_parts=20, capped=false)
+
+Construct an interpolated codon model whose omega mixture approximates a gamma
+distribution. With `capped=true`, omega quantiles are capped at one.
+"""
 function construct_GammaBWMM(alpha, mean, shape, nuc_matrix, F3x4; num_parts=20, capped=false)
     omega_vec = gamma_slices(mean, shape, num_parts)
     if capped
@@ -87,8 +104,14 @@ function construct_GammaBWMM(alpha, mean, shape, nuc_matrix, F3x4; num_parts=20,
     m = MolecularEvolution.InterpolatedDiscreteModel(ps, ts)
     return m
 end
+"""
+    gamma_BWMM_grid(mugrid, shapegrid, alphagrid, grid_dims, GTRmat,
+        F3x4_freqs, tree; verbosity=1)
 
-
+Compute the category-by-site log conditional-likelihood matrix for the FLAVOR
+grid. Categories are ordered with `alpha` varying fastest, then `shape`, `mu`,
+and finally the uncapped/capped state.
+"""
 function gamma_BWMM_grid(mugrid, shapegrid, alphagrid, grid_dims, GTRmat, F3x4_freqs, tree::FelNode; verbosity=1)
     #Calculates the conditional likelihood grid.
     num_sites = CodonMolecularEvolution.sites(tree.message[1])
@@ -175,8 +198,8 @@ function prop_pos(gp, capped)
     return mean(s .> 1.0)
 end
 
-#Note: we exclude the sites where there were no categories with omega > 1, even if they are uncapped.
-get_pos_sel_mask(f::FLAVORgrid) = vcat(prop_pos.(f.gridpoints, false), prop_pos.(f.gridpoints, true)) .> 0.0 #[i <= l/2 for i in 1:l]
+# Exclude uncapped categories whose discretized omega distribution never exceeds one.
+get_pos_sel_mask(f::FLAVORgrid) = vcat(prop_pos.(f.gridpoints, false), prop_pos.(f.gridpoints, true)) .> 0.0
 
 function gen_BAME_plots(posterior_pos, bfs, pos_thresh)
     #Posteriors:
@@ -200,12 +223,10 @@ function gen_BAME_plots(posterior_pos, bfs, pos_thresh)
     savefig(outpath * "_SiteBayesFactors.pdf")
 end
 
-#BAME shouldn't live in FLAVOR.jl
-#Need to make this match the smoothFUBAR setup with the first argument controlling the method (EM, Gibbs, etc)
 function BAME(f::BAMEgrid, outpath; pos_thresh=0.9, verbosity=1, method=(sampler=:DirichletEM, concentration=0.1, iterations=2500), plots=true)
     l = size(f.prob_matrix, 1)
     num_sites = size(f.prob_matrix, 2)
-    θ = weightEM(f.prob_matrix, ones(l) ./ l, conc=method.concentration, iters=method.iterations) # Want to change this to something else.
+    θ = weightEM(f.prob_matrix, ones(l) ./ l, conc=method.concentration, iters=method.iterations)
 
     pos_sel_mask = get_pos_sel_mask(f)
     pos_prior = sum(pos_sel_mask .* θ)
@@ -239,5 +260,3 @@ function FLAVOR(f::FLAVORgrid, outpath; pos_thresh=0.9, verbosity=1, method=(sam
 end
 
 export FLAVOR
-
-

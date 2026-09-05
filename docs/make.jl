@@ -16,6 +16,7 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "smoothFLAVOR" => "smoothFLAVOR.md",
         "difFUBAR.md",
         "shared.md",
         "dataprep.md"

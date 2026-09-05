@@ -1,13 +1,10 @@
 """
-This file contains code for applying Gaussian smoothing to multi-dimensional arrays in a way that works with automatic differentiation.
-"""
+    apply_smoothing(reshaping_scheme, ambient_parameters, kernel_parameters;
+        dims, smoothing_method=TruncatedGaussianConvolution())
 
-
-"""
-# apply_smoothing(reshaping_scheme::ProbabilityVectorReshapingScheme, ambient_parameters::AbstractVector{<:Real}, kernel_parameters::AbstractVector{<:Real}, dims=ntuple(identity, length(reshaping_scheme.grid_sizes)))
-Applies Gaussian smoothing to the ambient parameters (with dimension equaling
-that of the probability vector). The bandwidth has variance
-`kernel_parameters[1]^2`; `smoothing_method` selects the smoothing geometry.
+Apply Gaussian smoothing to ambient category logits along the selected grid
+dimensions. The effective bandwidth is `abs(kernel_parameters[1])`;
+`smoothing_method` selects the smoothing geometry.
 """
 function apply_smoothing(
     reshaping_scheme::ProbabilityVectorReshapingScheme,
@@ -42,10 +39,10 @@ end
 """
     gaussian_covariance_matrix(n, variance; jitter=1e-6)
 
-Return the full `n × n` Gaussian correlation matrix. Its support spans every
-possible grid offset (equivalent to a convolution width of `2n - 1`). A
-diagonal nugget bounds the condition number, and division by `1 + jitter`
-preserves unit marginal variance.
+Return the full `n × n` Gaussian correlation matrix for a grid dimension. Its
+support spans every possible grid offset (equivalent to a convolution width of
+`2n - 1`). A diagonal nugget bounds the condition number, and division by
+`1 + jitter` preserves unit marginal variance.
 """
 function gaussian_covariance_matrix(
     n::Int,
@@ -151,24 +148,30 @@ function apply_gaussian_covariance_factors(
 end
 
 """
-# gaussian_kernel(window_size::Int64, variance::Real)
-Generates a 1D Gaussian kernel for convolution.
+    gaussian_kernel(window_size, variance)
+
+Return an L2-normalized, one-dimensional Gaussian convolution kernel.
+
+The variance is floored slightly for numerical stability. When this kernel is
+used with [`same_conv`](@ref), zero padding intentionally reduces marginal
+variance near grid boundaries. smoothFLAVOR instead uses
+[`GaussianCovarianceSmoothing`](@ref), which preserves unit marginal variance.
 """
 function gaussian_kernel(window_size::Int64, variance::Real)
-    # window_size should be odd for symmetry, but not mandatory
     radius = (window_size - 1) ÷ 2
-    x = -radius:radius                  # symmetric points centered at zero
-    kernel = exp.(-(x .^ 2) ./ (2 * (variance + 1e-6)))  # element-wise Gaussian formula, variance is floored to protect against numerical issues.
-    kernel /= sqrt(sum(kernel .^ 2))               # This is to make the variance not depend on smoothing TODO: But on the edges this is a bit of a problem?
+    x = -radius:radius
+    kernel = exp.(-(x .^ 2) ./ (2 * (variance + 1e-6)))
+    kernel /= sqrt(sum(abs2, kernel))
     return kernel
 end
 
 """
-# apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real})
-Applies a separable convolution defined by kernel to a multi-dimensional array x.
+    apply_separable_convolution(x, kernel; dims)
+
+Apply a separable convolution along the selected dimensions of `x`.
 """
 function apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real}; dims=ntuple(identity, ndims(x)))
-    y = copy(x) # Zygote does not like mutation
+    y = copy(x)
     for d in dims
         y = convolve_along_dim(y, kernel, d)
     end
@@ -176,15 +179,15 @@ function apply_separable_convolution(x::AbstractArray{<:Real}, kernel::AbstractV
 end
 
 """
-# convolve_along_dim(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real}, dim::Int)
-Convolves the array x with the kernel along the specified dimension dim.
+    convolve_along_dim(x, kernel, dim)
+
+Convolve `x` with `kernel` along dimension `dim`, preserving the size of `x`.
 """
 function convolve_along_dim(x::AbstractArray{<:Real}, kernel::AbstractVector{<:Real}, dim::Int)
     perm = (dim, filter(d -> d != dim, 1:ndims(x))...)
     x_perm = permutedims(x, perm)
     sz = size(x_perm)
     reshaped = reshape(x_perm, sz[1], :)
-    #result = map(col -> same_conv(col, kernel), eachcol(reshaped))
     result = map(col -> same_conv(col, kernel), eachcol(reshaped))
     result_mat = hcat(result...)
     result_array = reshape(result_mat, sz...)
@@ -221,8 +224,9 @@ function multiply_along_dim(
 end
 
 """
-# conv_pure(x::AbstractVector{<:Real}, kernel::AbstractVector{<:Real})
-Applies a 1D convolution to the input vector x using the specified kernel.
+    conv_pure(x, kernel)
+
+Compute the valid one-dimensional convolution of `x` with `kernel`.
 """
 function conv_pure(x::AbstractVector{<:Real}, kernel::AbstractVector{<:Real})
     nx = length(x)
@@ -232,19 +236,15 @@ function conv_pure(x::AbstractVector{<:Real}, kernel::AbstractVector{<:Real})
 end
 
 """
-# same_conv(col::AbstractVector{<:Real}, kernel::AbstractVector{<:Real})
-Applies a 1D convolution to the input vector col using the specified kernel, padding with zeros.
+    same_conv(col, kernel)
+
+Convolve a vector with zero padding and return a vector of the same length.
 """
 function same_conv(col, kernel)
     klen = length(kernel)
     left = fld(klen - 1, 2)
     right = cld(klen - 1, 2)
-    # Padding behaviour is encoded here.
-    # Different padding behaviour has different interpretation
-    # TODO: What is the best behaviour when padding? A bit of a cursed solution would be to pad with more theta values.
-    #padded = vcat(zeros(left) .+ col[1], col, zeros(right) .+ col[end]) # Padding with edge values makes sense here I think, because our best guess at the values directly outside of the grid should be the values at the edge of the grid.
-    #padded = vcat(reverse(col[2:left+1]), col, reverse(col[end-right:end-1])) # Mirror
-    padded = vcat(zeros(left), col, zeros(right)) # Padding with zeros, may be good.
+    padded = vcat(zeros(left), col, zeros(right))
     conv_result = conv_pure(padded, kernel)
     return conv_result
 end

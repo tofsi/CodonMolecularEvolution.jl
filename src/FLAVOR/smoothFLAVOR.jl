@@ -1,13 +1,12 @@
-
-
 """
     flavor_con_lik_matrix(flavorgrid; normalized=true)
 
-Return the category-by-site conditional likelihood matrix used by FLAVOR.
+Return FLAVOR's category-by-site conditional likelihood matrix as `Float64`.
 
 With `normalized=true`, this is `flavorgrid.prob_matrix`, which differs from the
 unnormalized conditional likelihood matrix only by a site-specific multiplicative
-constant and therefore induces the same posterior over category weights.
+constant. Consequently, normalization does not change posterior category weights.
+Set `normalized=false` to restore those constants from `flavorgrid.site_scalers`.
 """
 function flavor_con_lik_matrix(flavorgrid::FLAVORgrid; normalized::Bool=true)
     prob_matrix = Float64.(Matrix(getproperty(flavorgrid, :prob_matrix)))
@@ -17,14 +16,21 @@ function flavor_con_lik_matrix(flavorgrid::FLAVORgrid; normalized::Bool=true)
 
     hasproperty(flavorgrid, :site_scalers) || throw(ArgumentError("normalized=false requires flavorgrid.site_scalers."))
     site_scalers = Float64.(collect(getproperty(flavorgrid, :site_scalers)))
+    length(site_scalers) == size(prob_matrix, 2) || throw(DimensionMismatch(
+        "FLAVOR site scalers do not match the number of likelihood-matrix columns",
+    ))
     return prob_matrix .* reshape(exp.(site_scalers), 1, :)
 end
 
 """
     flavor_parameter_metadata(flavorgrid)
 
-Construct the category metadata needed by `SKBDIModel` in FLAVOR's own category order:
-all uncapped grid points first, then all capped grid points.
+Construct the category metadata needed by [`SKBDIModel`](@ref).
+
+The returned named tuple contains parameter grids and names, parameter values and
+grid indices for every category, the positive-selection hypothesis mask, and the
+four-dimensional grid size. Category order is inherited from `flavorgrid`:
+all uncapped grid points first, followed by all capped grid points.
 """
 function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
     mugrid = Float64.(collect(getproperty(flavorgrid, :mugrid)))
@@ -38,6 +44,9 @@ function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
 
     codon_param_vec = Vector{Float64}[]
     codon_param_index_vec = Vector{Int64}[]
+
+    length(gridpoints) == length(mugrid) * length(shapegrid) * length(alphagrid) ||
+        throw(DimensionMismatch("FLAVOR grid points do not span the parameter grids"))
 
     for (cap_index, capped) in enumerate((false, true))
         for gp in gridpoints
@@ -60,24 +69,25 @@ function flavor_parameter_metadata(flavorgrid::FLAVORgrid)
     )
 end
 
-# The following is for debugging purposes
-struct FlavorIdentityTransform
-    kernel_dim::Int
-    suppression_dim::Int
-    kernel_stddev::Float64
-    suppression_stddev::Float64
-end
-# and this...
-function (t::FlavorIdentityTransform)(ambient_sample::AbstractVector{<:Real})
-    kernel_parameters = ambient_sample[1:t.kernel_dim]
-    suppression_parameters = ambient_sample[t.kernel_dim+1:t.kernel_dim+t.suppression_dim]
-    ambient_unsuppressed_parameters = ambient_sample[t.kernel_dim+t.suppression_dim+1:end]
+function _flavor_reshaping_scheme(meta, fast_reshaping::Bool)
+    if !fast_reshaping
+        return GeneralCategoricalReshapingScheme(
+            meta.grid_sizes,
+            meta.codon_param_index_vec,
+        )
+    end
 
-    return vcat(
-        t.kernel_stddev .* kernel_parameters,
-        t.suppression_stddev .* suppression_parameters,
-        ambient_unsuppressed_parameters,
-    )
+    expected_indices = [
+        [mu_index, shape_index, alpha_index, cap_index]
+        for cap_index in axes(meta.parameter_grids[4], 1)
+        for mu_index in axes(meta.parameter_grids[1], 1)
+        for shape_index in axes(meta.parameter_grids[2], 1)
+        for alpha_index in axes(meta.parameter_grids[3], 1)
+    ]
+    meta.codon_param_index_vec == expected_indices || throw(ArgumentError(
+        "fast_reshaping=true requires FLAVOR categories ordered by capped, mu, shape, then alpha; use fast_reshaping=false for a custom order",
+    ))
+    return FLAVORReshapingScheme(meta.grid_sizes)
 end
 
 """
@@ -85,8 +95,21 @@ end
 
 Construct an `SKBDIModel` directly from a `FLAVORgrid`.
 
-The single hypothesis mask corresponds to FLAVOR's own positive-selection-capable
-categories, as returned by `CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)`.
+The model places independent standard-normal priors on an ambient logit for each
+FLAVOR category and on one latent bandwidth parameter. The logits are correlated
+along the `mu` and `alpha` axes with [`GaussianCovarianceSmoothing`](@ref), then
+mapped to category weights with a softmax. `kernel_stddev` is the prior standard
+deviation of the latent bandwidth, not a fixed bandwidth; a posterior draw `z`
+uses bandwidth `abs(kernel_stddev * z)`.
+
+`fast_reshaping=true` uses FLAVOR's standard category order and verifies that
+order before constructing the model. Set it to `false` for custom category
+ordering. `normalized=false` restores the per-site likelihood constants, which
+changes the log likelihood only by a parameter-independent constant.
+
+Set `suppress=true` to add a suppression parameter for FLAVOR's
+positive-selection-capable categories. The current smoothing implementation
+supports exactly one bandwidth parameter, so `kernel_dim` must be `1`.
 """
 function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     normalized::Bool=true,
@@ -98,6 +121,13 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     suppression_stddev::Real=2.0,
     transition_function=s -> quintic_smooth_transition(s, 0.0, 1.0))
 
+    kernel_dim == 1 || throw(ArgumentError(
+        "smoothFLAVOR supports exactly one kernel parameter; got kernel_dim=$kernel_dim",
+    ))
+    kernel_stddev >= 0 || throw(ArgumentError(
+        "kernel_stddev must be nonnegative; got $kernel_stddev",
+    ))
+
     meta = flavor_parameter_metadata(flavorgrid)
     con_lik_matrix = flavor_con_lik_matrix(flavorgrid; normalized=normalized)
     log_con_lik_matrix = log.(con_lik_matrix)
@@ -105,24 +135,16 @@ function SKBDIModel_from_FLAVOR(flavorgrid::FLAVORgrid;
     n_categories = size(con_lik_matrix, 1)
     length(meta.codon_param_vec) == n_categories || throw(DimensionMismatch("Category metadata does not match con_lik_matrix."))
     size(meta.hypothesis_masks, 2) == n_categories || throw(DimensionMismatch("Hypothesis mask does not match con_lik_matrix."))
-    reshaping_scheme = fast_reshaping ? FLAVORReshapingScheme(meta.grid_sizes) : GeneralCategoricalReshapingScheme(meta.grid_sizes, meta.codon_param_index_vec)
+    reshaping_scheme = _flavor_reshaping_scheme(meta, fast_reshaping)
     ambient_to_parameter_transform = AmbientToParameterTransform(
         reshaping_scheme,
-        1,
+        kernel_dim,
         suppress ? 1 : 0,
         kernel_stddev,
         suppress ? suppression_stddev : 0.0,
         (1, 3),  # μ, α; do not smooth shape, "capped"
         smoothing_method=GaussianCovarianceSmoothing(covariance_jitter),
-    ) #TODO: grid_based_transform assumes diffubar ordering of codon_param_vec.
-
-    # ambient_to_parameter_transform = identity
-    #= ambient_to_parameter_transform = FlavorIdentityTransform(
-    kernel_dim,
-    0,                  # suppression_dim
-    kernel_stddev,
-    suppression_stddev,
-    ) =#
+    )
     return SKBDIModel(
         meta.parameter_grids,
         meta.parameter_names,
@@ -141,30 +163,61 @@ end
 """
     GeneralizedFUBARModel_from_FLAVOR(flavorgrid; kwargs...)
 
-Convenience constructor returning `GeneralizedFUBARModel(SKBDIModel_from_FLAVOR(flavorgrid; kwargs...))`.
+Construct the [`GeneralizedFUBARModel`](@ref) sampled by smoothFLAVOR.
+
+All keyword arguments are forwarded to [`SKBDIModel_from_FLAVOR`](@ref).
 """
 function GeneralizedFUBARModel_from_FLAVOR(flavorgrid::FLAVORgrid; kwargs...)
     return GeneralizedFUBARModel(SKBDIModel_from_FLAVOR(flavorgrid; kwargs...))
 end
-
-
-
-# same formula as in FLAVOR
+# This is algebraically identical to `bayes_factor` in `FLAVOR.jl`.
 bayes_factor_bame_analog(posterior, prior) = (posterior / (1 - posterior)) / (prior / (1 - prior))
 
+"""
+    summarize_smoothFLAVOR_BAME(flavorgrid, fubar_model, ambient_samples;
+        burnin, pos_thresh=0.9, sample_allocations=false, progress=false)
+
+Summarize retained smoothFLAVOR draws as site-wise positive-selection results.
+
+The first `burnin` iterations of every chain are discarded. For every retained
+draw, the function computes the conditional category probabilities at each site
+and averages them into `posterior_mat`. Positive-selection probabilities are the
+mass assigned to `get_pos_sel_mask(flavorgrid)`. Bayes factors use the posterior
+mean positive-category mass as the plug-in prior odds, matching FLAVOR's BAME
+calculation.
+
+When `sample_allocations=true`, one category is also drawn per site and retained
+iteration; the resulting counts are returned as `alloc_grid`. These stochastic
+counts are not used to calculate the reported posterior probabilities.
+
+Returns a named tuple containing the result `DataFrame`, full posterior matrix,
+posterior mean category weights, Bayes factors, masks, optional allocations, and
+the total number of retained draws (`n_used`).
+"""
 function summarize_smoothFLAVOR_BAME(
     flavorgrid,
     fubar_model::GeneralizedFUBARModel,
     ambient_samples::Vector;
     burnin::Int,
-    pos_thresh::Float64=0.9,
+    pos_thresh::Real=0.9,
     sample_allocations::Bool=false,
     progress::Bool=false,
 )
     con_lik = fubar_model.con_lik_matrix
     n_categories, n_sites = size(con_lik)
 
-    pos_sel_mask = CodonMolecularEvolution.get_pos_sel_mask(flavorgrid)
+    isempty(ambient_samples) && throw(ArgumentError("ambient_samples must contain at least one chain"))
+    all(chain -> 0 <= burnin < length(chain), ambient_samples) || throw(ArgumentError(
+        "burnin must leave at least one retained iteration in every chain",
+    ))
+    0 <= pos_thresh <= 1 || throw(ArgumentError(
+        "pos_thresh must be between zero and one; got $pos_thresh",
+    ))
+
+    pos_sel_mask = Bool.(CodonMolecularEvolution.get_pos_sel_mask(flavorgrid))
+    length(pos_sel_mask) == n_categories || throw(DimensionMismatch(
+        "Positive-selection mask does not match the likelihood categories",
+    ))
 
     posterior_mat = zeros(Float64, n_categories, n_sites)
     θ_mean = zeros(Float64, n_categories)
@@ -190,9 +243,9 @@ function summarize_smoothFLAVOR_BAME(
                     z += weight
                 end
 
-                # Should not happen if con_lik columns are valid, but guard anyway
-                if z <= 0
-                    continue
+                # Invalid likelihood columns cannot define category probabilities.
+                if !(isfinite(z) && z > 0)
+                    throw(DomainError(z, "conditional category weights must have positive mass"))
                 end
 
                 inverse_z = inv(z)
@@ -215,10 +268,10 @@ function summarize_smoothFLAVOR_BAME(
 
     posterior_probs = vec(sum(posterior_mat[pos_sel_mask, :], dims=1))
 
-    # BAME-like plug-in prior mass
+    # BAME uses the fitted category weights as plug-in prior category masses.
     pos_prior = sum(θ_mean[pos_sel_mask])
 
-    # avoid 0/1 blowups
+    # Keep odds finite when floating-point values reach a probability boundary.
     eps = 1e-12
     posterior_probs_clamped = clamp.(posterior_probs, eps, 1 - eps)
     pos_prior_clamped = clamp(pos_prior, eps, 1 - eps)
@@ -276,6 +329,25 @@ function _ambient_parameter_names(sk_model::SKBDIModel)
     return names
 end
 
+"""
+    save_smoothFLAVOR_chain_artifacts!(outpath, ambient_samples, parameter_names;
+        burnin, n_adapts, save_chain_samples=true)
+    save_smoothFLAVOR_chain_artifacts!(outpath, ambient_samples, sk_model; kwargs...)
+
+Write posterior-chain diagnostics for a smoothFLAVOR run.
+
+`ambient_samples` must contain equally sized chains, each represented as a
+sequence of equal-length parameter vectors. Diagnostics are computed from the
+iterations after `burnin` and written to:
+
+- `outpath * "_chain_diagnostics.csv"`: R-hat and bulk/tail ESS per parameter.
+- `outpath * "_chain_diagnostics_summary.csv"`: worst-case diagnostic values.
+- `outpath * "_chain_samples.jld2"`: all draws, including adaptation and burn-in,
+  when `save_chain_samples=true`.
+
+The `sk_model` method derives stable names for kernel, suppression, and ambient
+weight parameters. The parent directory of `outpath` must already exist.
+"""
 function save_smoothFLAVOR_chain_artifacts!(
     outpath::AbstractString,
     ambient_samples::Vector,
@@ -353,6 +425,23 @@ function _nuts_statistic(stat, name::Symbol)
     return getproperty(stat, name)
 end
 
+"""
+    save_NUTS_sampler_artifacts!(outpath, chain_stats;
+        burnin, n_adapts, max_tree_depth=10)
+
+Write iteration-level and chain-level NUTS diagnostics for smoothFLAVOR.
+
+Every sampler-statistics chain must have the same length. Iterations are labeled
+as adaptation, post-adaptation burn-in, or retained. The generated files are:
+
+- `outpath * "_sampler_trace.csv"`: sampler statistics for every iteration.
+- `outpath * "_sampler_diagnostics.csv"`: retained-sample diagnostics by chain.
+- `outpath * "_sampler_diagnostics_summary.csv"`: aggregate numerical-error,
+  tree-depth, E-BFMI, acceptance-rate, and log-density diagnostics.
+
+Log-density R-hat and ESS are reported only when at least two chains and four
+retained draws per chain are available; otherwise those fields are `NaN`.
+"""
 function save_NUTS_sampler_artifacts!(
     outpath::AbstractString,
     chain_stats::Vector;
@@ -502,6 +591,39 @@ function save_smoothFLAVOR_chain_artifacts!(
     )
 end
 
+"""
+    smoothFLAVOR_BAME(flavorgrid, outpath; kwargs...)
+
+Fit smoothed FLAVOR category weights with NUTS and report site-wise evidence for
+positive selection.
+
+Each chain contains `iters` draws, of which the first `n_adapts` tune the sampler
+and the first `burnin` are excluded from posterior summaries. The required
+relationship is `0 <= n_adapts <= burnin < iters`. Chains run concurrently when
+Julia has multiple threads. `max_tree_depth` limits each NUTS trajectory.
+
+The smoothing model uses one sampled bandwidth and Gaussian covariance along the
+FLAVOR `mu` and `alpha` grid dimensions; `shape` and `capped` are not smoothed.
+`kernel_stddev` is the prior scale of that bandwidth. `covariance_jitter`
+stabilizes the Gaussian correlation matrix. See [`SKBDIModel_from_FLAVOR`](@ref)
+for the model parameterization.
+
+`pos_thresh` controls the Boolean `threshold` column. Set `sample_allocations`
+to retain stochastic category-allocation counts in the returned results. The
+default `iters=10` is suitable only for smoke tests; substantive analyses should
+use enough retained draws and chains to establish convergence.
+
+When `exports=true`, the site table is written to
+`outpath * "_smoothFLAVOR_BAME.csv"`. If either `save_chain_diagnostics` or
+`save_chain_samples` is true, posterior and sampler diagnostic CSVs are also
+written; the JLD2 draws are written only when `save_chain_samples=true`. The
+parent directory of `outpath` must already exist.
+
+Returns `(df, results)`. `df` has `site`, `posterior_prob_positive`,
+`bayes_factor`, and `threshold` columns. `results` contains the samples, sampler
+statistics, constructed models, category-level posterior summaries, optional
+allocation counts, and any saved-chain artifacts.
+"""
 function smoothFLAVOR_BAME(
     flavorgrid,
     outpath;
@@ -524,6 +646,9 @@ function smoothFLAVOR_BAME(
         throw(ArgumentError("n_adapts must satisfy 0 <= n_adapts < iters; got n_adapts=$n_adapts, iters=$iters"))
     n_adapts <= burnin < iters || throw(ArgumentError(
         "burnin must satisfy n_adapts <= burnin < iters; got n_adapts=$n_adapts, burnin=$burnin, iters=$iters",
+    ))
+    0 <= pos_thresh <= 1 || throw(ArgumentError(
+        "pos_thresh must be between zero and one; got $pos_thresh",
     ))
 
     sk_model = SKBDIModel_from_FLAVOR(

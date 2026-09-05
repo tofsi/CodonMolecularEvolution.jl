@@ -1,4 +1,4 @@
-# smoothFLAVOR parameter study refactor
+# smoothFLAVOR parameter study
 
 This layout makes the sweep code single-source-of-truth:
 
@@ -32,29 +32,24 @@ It runs:
 2. `MEME` once, using its site-wise episodic-selection likelihood-ratio test.
 3. `smoothFLAVOR_BAME` once for each positive `kernel_stddev`.
 
+`kernel_stddev` is the prior standard deviation of smoothFLAVOR's sampled
+bandwidth parameter, not a fixed kernel width. For ambient draw `z`, the
+effective bandwidth is `abs(kernel_stddev * z)`.
+
 `omnibus_multi.jl` does not duplicate sweep logic. It only discovers simulations, loads one simulation, builds the `FLAVORgrid`, then calls `run_parameter_sweep_on_flavorgrid!`.
 
 This avoids the earlier problem where changes to one study file did nothing because the omnibus driver had its own copy of the sweep loop.
-
-## Install/copy
-
-Copy the `src`, `scripts`, and `python` folders into:
-
-```text
-CodonMolecularEvolution.jl/parameter_study/
-```
-
-The scripts assume they live inside `parameter_study/scripts`.
 
 ## Julia package requirements
 
 From the repository root:
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.add(["CSV","DataFrames","NPZ","ZipFile"])'
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-`CodonMolecularEvolution` should be the local package in the repo root project.
+The repository project already declares the study dependencies, including CSV,
+DataFrames, NPZ, and ZipFile.
 
 ## Run one simulation
 
@@ -351,4 +346,5 @@ If the run stops halfway through a simulation, rerunning skips `original_BAME` a
 
 ## Notes
 
-This refactor intentionally does not include the no-smoothing case. All `kernel_stddevs` must be strictly positive.
+This study intentionally does not include the no-smoothing case. All
+`kernel_stddevs` must be strictly positive.

@@ -144,3 +144,88 @@
     @test isfinite(likelihood_value)
     @test all(isfinite, likelihood_gradient)
 end
+
+@testset "smoothFLAVOR category reshaping" begin
+    mugrid = [0.5, 2.0]
+    shapegrid = [0.5, 1.5]
+    alphagrid = [0.1, 1.0, 10.0]
+    gridpoints = [
+        (mu, shape, alpha)
+        for mu in mugrid
+        for shape in shapegrid
+        for alpha in alphagrid
+    ]
+    grid_sizes = (length(mugrid), length(shapegrid), length(alphagrid), 2)
+    n_categories = prod(grid_sizes)
+    n_sites = 3
+    flavorgrid = CodonMolecularEvolution.FLAVORgrid(
+        identity,
+        identity,
+        mugrid,
+        shapegrid,
+        alphagrid,
+        gridpoints,
+        collect(grid_sizes[1:3]),
+        fill(inv(n_categories), n_categories, n_sites),
+        zeros(n_sites),
+    )
+
+    metadata = CodonMolecularEvolution.flavor_parameter_metadata(flavorgrid)
+    fast_scheme = CodonMolecularEvolution.FLAVORReshapingScheme(grid_sizes)
+    general_scheme = CodonMolecularEvolution.GeneralCategoricalReshapingScheme(
+        grid_sizes,
+        metadata.codon_param_index_vec,
+    )
+    category_values = collect(1.0:n_categories)
+    fast_array = CodonMolecularEvolution.reshape_probability_vector(
+        fast_scheme,
+        category_values,
+    )
+    general_array = CodonMolecularEvolution.reshape_probability_vector(
+        general_scheme,
+        category_values,
+    )
+
+    @test fast_array == general_array
+    @test CodonMolecularEvolution.unreshape_probability_vector(
+        fast_scheme,
+        fast_array,
+    ) == category_values
+    @test CodonMolecularEvolution.flavor_con_lik_matrix(
+        flavorgrid;
+        normalized=false,
+    ) == flavorgrid.prob_matrix
+
+    @test_throws ArgumentError CodonMolecularEvolution.SKBDIModel_from_FLAVOR(
+        flavorgrid;
+        kernel_dim=2,
+    )
+    @test_throws ArgumentError CodonMolecularEvolution.SKBDIModel_from_FLAVOR(
+        flavorgrid;
+        kernel_stddev=-1.0,
+    )
+
+    custom_gridpoints = copy(gridpoints)
+    custom_gridpoints[1], custom_gridpoints[2] = custom_gridpoints[2], custom_gridpoints[1]
+    custom_flavorgrid = CodonMolecularEvolution.FLAVORgrid(
+        identity,
+        identity,
+        mugrid,
+        shapegrid,
+        alphagrid,
+        custom_gridpoints,
+        collect(grid_sizes[1:3]),
+        flavorgrid.prob_matrix,
+        flavorgrid.site_scalers,
+    )
+    @test_throws ArgumentError CodonMolecularEvolution.SKBDIModel_from_FLAVOR(
+        custom_flavorgrid;
+        fast_reshaping=true,
+    )
+    custom_model = CodonMolecularEvolution.SKBDIModel_from_FLAVOR(
+        custom_flavorgrid;
+        fast_reshaping=false,
+    )
+    @test custom_model.ambient_to_parameter_transform.reshaping_scheme isa
+          CodonMolecularEvolution.GeneralCategoricalReshapingScheme
+end
